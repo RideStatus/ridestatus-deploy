@@ -143,42 +143,113 @@ for iface in "${ALL_IFACES[@]}"; do
 done
 
 # =============================================================================
-# Enumerate USB NICs — free list only
+# Enumerate USB NICs — free list keyed by USB bus path
+#
+# USB NICs are identified by their sysfs bus path (e.g. "1-1.2"), not by
+# vendor:product ID. This ensures two identical USB NICs (same make/model)
+# are treated as distinct devices and only the actually-claimed one is
+# excluded from the free list.
+#
+# Proxmox stores USB passthrough in VM config as either:
+#   host=<vendorid>:<productid>   — ambiguous when multiple identical NICs exist
+#   host=<bus>-<port>             — unambiguous, preferred
+#
+# We read both forms from existing VM configs and resolve vendor:product
+# entries back to bus paths so the claimed set is always bus-path keyed.
 # =============================================================================
 header "USB NIC Detection"
 
-declare -A USB_NIC_VENDOR_PRODUCT
-declare -A USB_NIC_CLAIMED_BY
+# Maps: iface -> vendor:product, iface -> bus path (e.g. "1-1.2")
+declare -A USB_NIC_VENDOR_PRODUCT   # iface -> "vvvv:pppp"
+declare -A USB_NIC_BUS_PATH         # iface -> "bus-port" (e.g. "1-1.2")
+
+# Set of bus paths claimed by existing VMs
+declare -A USB_BUS_PATH_CLAIMED_BY  # bus_path -> vmid
+
 declare -a FREE_USB_NICS=()
 
 for iface in "${ALL_IFACES[@]}"; do
   syspath=$(readlink -f "/sys/class/net/${iface}/device" 2>/dev/null || true)
-  if echo "$syspath" | grep -q '/usb'; then
-    usb_dir=$(echo "$syspath" | sed 's|/[^/]*$||')
-    vp=$(cat "${usb_dir}/idVendor"  2>/dev/null || true)
-    pp=$(cat "${usb_dir}/idProduct" 2>/dev/null || true)
-    [[ -n "$vp" && -n "$pp" ]] && USB_NIC_VENDOR_PRODUCT["$iface"]="${vp}:${pp}"
-  fi
+  [[ -z "$syspath" ]] && continue
+  echo "$syspath" | grep -q '/usb' || continue
+
+  # Walk up sysfs to find the USB interface directory (contains idVendor/idProduct)
+  usb_dir=$(echo "$syspath" | sed 's|/[^/]*$||')
+  vp=""
+  while [[ "$usb_dir" =~ /usb ]]; do
+    v=$(cat "${usb_dir}/idVendor"  2>/dev/null || true)
+    p=$(cat "${usb_dir}/idProduct" 2>/dev/null || true)
+    if [[ -n "$v" && -n "$p" ]]; then
+      vp="${v}:${p}"
+      break
+    fi
+    usb_dir=$(dirname "$usb_dir")
+  done
+  [[ -z "$vp" ]] && continue
+  USB_NIC_VENDOR_PRODUCT["$iface"]="$vp"
+
+  # Extract bus path from sysfs path.
+  # sysfs path looks like: /sys/bus/usb/devices/1-1.2/...
+  # The bus path component is the segment after /devices/ that matches N-N[.N]*
+  bus_path=$(echo "$syspath" | grep -oP '(?<=/devices/)[\d]+-[\d.]+(?=/)' | head -1 || true)
+  [[ -n "$bus_path" ]] && USB_NIC_BUS_PATH["$iface"]="$bus_path"
 done
 
+# Build claimed set from existing VMs
 if [[ ${#USB_NIC_VENDOR_PRODUCT[@]} -gt 0 ]]; then
   mapfile -t ALL_VMIDS < <(
     pvesh get "/nodes/${PROXMOX_NODE}/qemu" --output-format json 2>/dev/null \
     | grep -o '"vmid":[0-9]*' | grep -o '[0-9]*' || true
   )
+
+  # Build a lookup: vendor:product -> list of known bus paths (from this host's NICs)
+  # Used to resolve vp-style VM config entries back to bus paths.
+  declare -A VP_TO_BUS_PATHS  # "vvvv:pppp" -> space-separated bus paths
+  for iface in "${!USB_NIC_BUS_PATH[@]}"; do
+    local_vp=${USB_NIC_VENDOR_PRODUCT[$iface]:-}
+    local_bp=${USB_NIC_BUS_PATH[$iface]}
+    [[ -z "$local_vp" ]] && continue
+    existing=${VP_TO_BUS_PATHS[$local_vp]:-}
+    VP_TO_BUS_PATHS["$local_vp"]="${existing:+$existing }$local_bp"
+  done
+
   for vmid in "${ALL_VMIDS[@]}"; do
     vm_config=$(pvesh get "/nodes/${PROXMOX_NODE}/qemu/${vmid}/config" \
                 --output-format json 2>/dev/null || true)
+
     while IFS= read -r usb_entry; do
-      vp=$(echo "$usb_entry" | grep -o 'host=[0-9a-f]*:[0-9a-f]*' | sed 's/host=//' || true)
-      [[ -n "$vp" ]] && USB_NIC_CLAIMED_BY["$vp"]="$vmid"
+      raw=$(echo "$usb_entry" | grep -o 'host=[^ ",]*' | sed 's/host=//' || true)
+      [[ -z "$raw" ]] && continue
+
+      if echo "$raw" | grep -qP '^\d+-[\d.]+$'; then
+        # Already a bus path — mark directly
+        USB_BUS_PATH_CLAIMED_BY["$raw"]="$vmid"
+      elif echo "$raw" | grep -qP '^[0-9a-f]{4}:[0-9a-f]{4}$'; then
+        # vendor:product form — resolve to bus paths on this host
+        # If only one NIC on this host has this vp, we know exactly which one.
+        # If multiple NICs share the vp, mark all of them as claimed to be safe
+        # (operator should use bus-path passthrough for identical NICs anyway).
+        known_paths=${VP_TO_BUS_PATHS[$raw]:-}
+        for bp in $known_paths; do
+          USB_BUS_PATH_CLAIMED_BY["$bp"]="$vmid"
+        done
+      fi
     done < <(echo "$vm_config" | grep -o '"usb[0-9]*":"[^"]*"' || true)
   done
 fi
 
+# Build free list: NICs whose bus path is not in the claimed set
 for iface in "${!USB_NIC_VENDOR_PRODUCT[@]}"; do
-  vp=${USB_NIC_VENDOR_PRODUCT[$iface]}
-  [[ -z "${USB_NIC_CLAIMED_BY[$vp]:-}" ]] && FREE_USB_NICS+=("$iface")
+  bp=${USB_NIC_BUS_PATH[$iface]:-}
+  if [[ -z "$bp" ]]; then
+    warn "Could not determine bus path for ${iface} — excluding from free list to be safe"
+    continue
+  fi
+  if [[ -z "${USB_BUS_PATH_CLAIMED_BY[$bp]:-}" ]]; then
+    FREE_USB_NICS+=("$iface")
+  else
+    info "USB NIC ${iface} (bus ${bp}) already claimed by VM ${USB_BUS_PATH_CLAIMED_BY[$bp]} — skipping"
+  fi
 done
 
 if   [[ ${#USB_NIC_VENDOR_PRODUCT[@]} -eq 0 ]]; then
@@ -189,7 +260,8 @@ else
   info "Free USB NICs available:"
   for iface in "${FREE_USB_NICS[@]}"; do
     mac=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo "unknown")
-    echo "  ${iface}  MAC=${mac}  vendor:product=${USB_NIC_VENDOR_PRODUCT[$iface]}"
+    bp=${USB_NIC_BUS_PATH[$iface]:-unknown}
+    echo "  ${iface}  MAC=${mac}  vendor:product=${USB_NIC_VENDOR_PRODUCT[$iface]}  bus=${bp}"
   done
 fi
 
@@ -285,14 +357,15 @@ configure_vm_nics() {
         local usb_opts=()
         for u in "${available_usb[@]}"; do
           local mac; mac=$(cat "/sys/class/net/${u}/address" 2>/dev/null || echo "unknown")
-          usb_opts+=("${u}  MAC=${mac}  (${USB_NIC_VENDOR_PRODUCT[$u]})")
+          local bp=${USB_NIC_BUS_PATH[$u]:-unknown}
+          usb_opts+=("${u}  MAC=${mac}  bus=${bp}  (${USB_NIC_VENDOR_PRODUCT[$u]})")
         done
         local usb_idx=0
         pick_menu usb_idx "Which USB NIC?" "${usb_opts[@]}"
         usb_iface=${available_usb[$usb_idx]}
       fi
       SESSION_CLAIMED_USB+=("$usb_iface")
-      ok "Reserved ${usb_iface} for ${vm_label} vNIC${nic_num}"
+      ok "Reserved ${usb_iface} (bus ${USB_NIC_BUS_PATH[$usb_iface]:-unknown}) for ${vm_label} vNIC${nic_num}"
     fi
 
     prompt_required ip_cidr \
@@ -397,9 +470,12 @@ print_vm_summary() {
   echo "    VM ID: ${vmid}  Hostname: ${hostname}  RAM: ${ram}GB  Cores: ${cores}  Disk: ${disk}GB"
   for i in "${!_nt[@]}"; do
     local conn=""
-    [[ "${_nt[$i]}" == "bridge" ]] \
-      && conn="bridge=${_nb[$i]}" \
-      || conn="USB passthrough=${_nu[$i]} (${USB_NIC_VENDOR_PRODUCT[${_nu[$i]}]:-unknown})"
+    if [[ "${_nt[$i]}" == "bridge" ]]; then
+      conn="bridge=${_nb[$i]}"
+    else
+      local bp=${USB_NIC_BUS_PATH[${_nu[$i]}]:-unknown}
+      conn="USB passthrough=${_nu[$i]} bus=${bp} (${USB_NIC_VENDOR_PRODUCT[${_nu[$i]}]:-unknown})"
+    fi
     local gw_str=""; [[ -n "${_ng[$i]:-}" ]] && gw_str="  GW=${_ng[$i]}"
     echo "    vNIC$((i+1)): ${_nl[$i]}  IP=${_ni[$i]}${gw_str}  [${conn}]"
   done
@@ -509,6 +585,10 @@ build_cloud_init_network() {
 
 # =============================================================================
 # Helper: create and configure a VM
+#
+# USB passthrough uses host=<bus>-<port> (e.g. host=1-1.2) rather than
+# host=<vendor>:<product>. This is unambiguous when multiple NICs of the
+# same make/model are present on the host.
 # =============================================================================
 create_vm() {
   local vmid=$1 hostname=$2 ram_gb=$3 cores=$4 disk_gb=$5
@@ -530,14 +610,25 @@ create_vm() {
   qm resize "$vmid" scsi0 "${disk_gb}G"
 
   local bridge_nic_idx=0
+  local usb_slot=0
   for i in "${!cv_type[@]}"; do
     if [[ "${cv_type[$i]}" == "bridge" ]]; then
       qm set "$vmid" --net${bridge_nic_idx} "virtio,bridge=${cv_bridge[$i]}"
       (( bridge_nic_idx++ ))
     else
-      local vp=${USB_NIC_VENDOR_PRODUCT[${cv_usb[$i]}]:-}
-      [[ -z "$vp" ]] && die "Cannot find vendor:product for ${cv_usb[$i]}"
-      qm set "$vmid" --usb${i} "host=${vp}"
+      local host_iface=${cv_usb[$i]}
+      local bp=${USB_NIC_BUS_PATH[$host_iface]:-}
+      if [[ -z "$bp" ]]; then
+        # Bus path unavailable — fall back to vendor:product with a warning
+        local vp=${USB_NIC_VENDOR_PRODUCT[$host_iface]:-}
+        [[ -z "$vp" ]] && die "Cannot find bus path or vendor:product for ${host_iface}"
+        warn "Bus path unavailable for ${host_iface} — falling back to host=${vp} (may be ambiguous)"
+        qm set "$vmid" --usb${usb_slot} "host=${vp}"
+      else
+        info "Assigning USB NIC ${host_iface} to VM ${vmid} via bus path host=${bp}"
+        qm set "$vmid" --usb${usb_slot} "host=${bp}"
+      fi
+      (( usb_slot++ ))
     fi
   done
 
