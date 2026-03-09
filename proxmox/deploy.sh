@@ -354,7 +354,9 @@ configure_vm_nics() {
       local b_idx=0
       pick_menu b_idx "Which bridge?" "${bridge_opts[@]}"
 
-      local existing_count=${#EXISTING_BRIDGES[@]:-0}
+      # ${#EXISTING_BRIDGES[@]} is always valid — :-0 default is not valid syntax
+      # for array length expressions and is not needed since the array is always defined.
+      local existing_count=${#EXISTING_BRIDGES[@]}
       if (( b_idx < existing_count )); then
         bridge_name=${EXISTING_BRIDGES[$b_idx]}
       else
