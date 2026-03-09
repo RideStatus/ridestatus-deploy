@@ -12,9 +12,10 @@
 #   exclusively for bootstrap SSH connections, then deletes it on exit.
 #
 # Cloud-init approach:
-#   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig)
-#   which work on any Proxmox storage. Does NOT require snippets content type.
-#   Packages and runcmd are handled by the bootstrap scripts after first boot.
+#   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig).
+#   The cloud-init ISO drive is attached to 'local' storage (not local-lvm)
+#   because local-lvm is LVM-thin and cannot host cloud-init ISO images.
+#   Packages and runcmd are handled by bootstrap scripts after first boot.
 #
 # USB NIC naming:
 #   After each VM boots, the QEMU guest agent is queried for real NIC names.
@@ -576,9 +577,10 @@ ensure_ubuntu_image() {
 # =============================================================================
 # Helper: create and configure a VM
 #
-# Cloud-init is applied via native qm parameters only — no snippets required.
-# SSH keys are passed via a temporary file (qm requires a file path for sshkeys).
-# Network is configured via --ipconfig which works on all storage types.
+# Disk is imported to local-lvm (block storage, fast I/O).
+# Cloud-init ISO drive is attached to 'local' (directory storage) — local-lvm
+# is LVM-thin and cannot host ISO/cloud-init image files.
+# SSH keys, IP config, and DNS are applied via native qm cloud-init parameters.
 # Packages and runcmd are handled by bootstrap scripts after first boot.
 #
 # USB passthrough uses host=<bus>-<port> (unambiguous with identical NICs).
@@ -588,18 +590,20 @@ create_vm() {
   local -n cv_type=$6 cv_bridge=$7 cv_usb=$8 cv_ip=$9 cv_gw=${10} cv_dns=${11}
 
   info "Creating VM ${vmid} (${hostname})..."
-  local ram_mb=$(( ram_gb * 1024 )) storage="local-lvm"
+  local ram_mb=$(( ram_gb * 1024 ))
+  local disk_storage="local-lvm"   # LVM-thin: block volumes (OS disk)
+  local ci_storage="local"         # Directory storage: ISO/cloud-init images
 
   qm create "$vmid" --name "$hostname" --memory "$ram_mb" --cores "$cores" \
     --cpu cputype=host --ostype l26 --agent enabled=1 --serial0 socket --vga serial0
 
   local img_copy="/tmp/ridestatus-vm${vmid}.img"
   cp "$UBUNTU_IMG_PATH" "$img_copy"
-  qm importdisk "$vmid" "$img_copy" "$storage" --format qcow2
+  qm importdisk "$vmid" "$img_copy" "$disk_storage" --format qcow2
   rm -f "$img_copy"
 
   qm set "$vmid" --scsihw virtio-scsi-pci \
-    --scsi0 "${storage}:vm-${vmid}-disk-0,discard=on" --boot order=scsi0
+    --scsi0 "${disk_storage}:vm-${vmid}-disk-0,discard=on" --boot order=scsi0
   qm resize "$vmid" scsi0 "${disk_gb}G"
 
   # Attach NICs
@@ -624,18 +628,16 @@ create_vm() {
     fi
   done
 
-  # Cloud-init: attach drive to local storage (works on all Proxmox installs)
-  qm set "$vmid" --ide2 "${storage}:cloudinit"
+  # Cloud-init drive: must use directory-based storage (not LVM-thin)
+  qm set "$vmid" --ide2 "${ci_storage}:cloudinit"
 
-  # SSH keys: write to a temp file (qm sshkeys requires a file path)
+  # SSH keys: qm requires a file path
   local sshkeys_file="/tmp/ridestatus-sshkeys-${vmid}.txt"
   printf '%s\n%s\n' "$DEPLOY_PUBKEY_CONTENT" "$ADMIN_SSH_PUBKEY" > "$sshkeys_file"
   qm set "$vmid" --ciuser ridestatus --sshkeys "$sshkeys_file"
   rm -f "$sshkeys_file"
 
-  # Network config via ipconfig (index matches net index, i.e. bridge NICs only)
-  # USB NICs don't get ipconfig entries — their IPs are set by the bootstrap scripts
-  # which patch netplan after the guest agent identifies the real interface name.
+  # Network: ipconfig index matches bridge NIC index (USB NICs patched later via guest agent)
   local ipconfig_idx=0
   for i in "${!cv_type[@]}"; do
     [[ "${cv_type[$i]}" != "bridge" ]] && continue
@@ -646,11 +648,8 @@ create_vm() {
     (( ipconfig_idx++ ))
   done
 
-  # DNS
-  local dns="${cv_dns[0]:-8.8.8.8}"
-  qm set "$vmid" --nameserver "$dns"
-
-  # Hostname
+  # DNS and hostname
+  qm set "$vmid" --nameserver "${cv_dns[0]:-8.8.8.8}"
   qm set "$vmid" --ciupgrade 0
 
   ok "VM ${vmid} configured"
