@@ -8,19 +8,19 @@
 #
 # What this script does:
 #   1.  Installs system packages
-#   2.  Configures chrony (stratum 2, internet pool — independent of edge nodes)
-#   3.  Installs Node.js 22 (via NodeSource)
-#   4.  Installs PostgreSQL 16 (via PGDG apt repo)
-#   5.  Creates ridestatus DB user and database
-#   6.  Ensures the 'ridestatus' OS user exists with correct home/permissions
-#   7.  Acquires the Ansible public key (auto via env var from deploy.sh,
+#   2.  Installs Node.js 22 (via NodeSource)
+#   3.  Installs PostgreSQL 16 (via PGDG apt repo)
+#   4.  Ensures the 'ridestatus' OS user exists with correct home/permissions
+#   5.  Acquires the Ansible public key (auto via env var from deploy.sh,
 #       or prompts for key server URL, or allows manual paste as fallback)
-#   8.  Stores the Ansible public key at ~/.ssh/ansible_ridestatus.pub and
-#       adds it to authorized_keys so Ansible can manage this VM
-#   9.  Interactively collects park config and writes /home/ridestatus/.env
+#   6.  Stores the Ansible public key and adds it to authorized_keys
+#   7.  Interactively collects park config and writes /home/ridestatus/.env
+#   8.  Configures chrony using the actual dept NIC subnet (stratum 2 internet,
+#       NTP server for edge nodes — allow scoped to dept subnet, not 0.0.0.0/0)
+#   9.  Creates ridestatus DB user and database
 #  10.  Clones ridestatus-server, installs npm deps, runs DB migrations
 #  11.  Installs PM2, registers ridestatus-server, enables PM2 startup
-#  12.  Configures UFW firewall rules
+#  12.  Configures UFW firewall (NTP restricted to dept subnet)
 #  13.  Prints a deployment summary
 #
 # Key handoff modes (in priority order):
@@ -64,6 +64,34 @@ prompt_required() {
   done
 }
 
+# Derive the network CIDR for a given interface using ipcalc-style logic.
+# e.g. IP=10.15.140.101, prefix=25 → "10.15.140.128/25" (network address/prefix)
+# Returns empty string if the interface has no IPv4 address yet.
+dept_nic_subnet() {
+  local iface=$1
+  local ip prefix network
+
+  # ip -o -4 addr: "2: ens18    inet 10.15.140.101/25 ..."
+  read -r ip prefix < <(
+    ip -o -4 addr show dev "$iface" 2>/dev/null \
+    | awk '{split($4,a,"/"); print a[1], a[2]}' | head -1
+  ) || true
+
+  [[ -z "$ip" || -z "$prefix" ]] && return 0
+
+  # Convert dotted IP to integer, mask off host bits, convert back
+  IFS=. read -r a b c d <<< "$ip"
+  local ip_int=$(( (a<<24) | (b<<16) | (c<<8) | d ))
+  local mask=$(( 0xFFFFFFFF << (32 - prefix) & 0xFFFFFFFF ))
+  local net_int=$(( ip_int & mask ))
+  printf "%d.%d.%d.%d/%d\n" \
+    $(( (net_int>>24) & 0xFF )) \
+    $(( (net_int>>16) & 0xFF )) \
+    $(( (net_int>>8)  & 0xFF )) \
+    $((  net_int      & 0xFF )) \
+    "$prefix"
+}
+
 [[ $EUID -eq 0 ]] || die "Must be run as root (sudo bash server.sh)"
 
 RS_USER="ridestatus"
@@ -96,47 +124,7 @@ apt-get install -y --no-install-recommends \
 ok "Packages installed"
 
 # =============================================================================
-# 2. Chrony — stratum 2 from internet, independent of edge nodes
-# Edge nodes will sync FROM this VM (server.sh does not configure that —
-# that is handled by edge-init.sh which points edge chrony at this VM's
-# dept-NIC IP). This VM just needs accurate time itself.
-# =============================================================================
-header "Configuring NTP (chrony)"
-
-cat > /etc/chrony/chrony.conf << 'EOF'
-# RideStatus Aggregation Server — chrony config
-# Syncs from internet NTP pool (stratum 2).
-# Edge nodes on the dept network sync from this VM (stratum 3).
-
-pool pool.ntp.org iburst minpoll 6 maxpoll 10
-
-# Allow edge nodes on the RideStatus dept network to sync from this VM.
-# The subnet here should match the DEPT_NIC subnet configured during deploy.
-# Default covers the reference park range; adjust if needed.
-allow 10.0.0.0/8
-
-# Serve time even if not synced (edge nodes may boot before we have sync)
-local stratum 3
-
-makestep 1.0 3
-rtcsync
-driftfile /var/lib/chrony/drift
-logdir /var/log/chrony
-EOF
-
-systemctl enable chrony
-systemctl restart chrony
-
-for i in $(seq 1 6); do
-  chronyc tracking 2>/dev/null | grep -q 'Leap status.*Normal' && break
-  sleep 5
-done
-chronyc tracking | grep 'Leap status' || warn "chrony not yet synced — may need internet route"
-
-ok "chrony configured (stratum 2, NTP server for edge nodes)"
-
-# =============================================================================
-# 3. Node.js 22
+# 2. Node.js 22
 # =============================================================================
 header "Installing Node.js 22"
 
@@ -149,7 +137,7 @@ else
 fi
 
 # =============================================================================
-# 4. PostgreSQL 16
+# 3. PostgreSQL 16
 # =============================================================================
 header "Installing PostgreSQL 16"
 
@@ -169,11 +157,10 @@ fi
 
 systemctl enable postgresql
 systemctl start postgresql
-
 ok "PostgreSQL running"
 
 # =============================================================================
-# 5. ridestatus OS user
+# 4. ridestatus OS user
 # =============================================================================
 header "Ensuring ridestatus User"
 
@@ -187,11 +174,10 @@ fi
 mkdir -p "${RS_HOME}/.ssh" "$LOG_DIR"
 chmod 700 "${RS_HOME}/.ssh"
 chown -R "${RS_USER}:${RS_USER}" "$RS_HOME"
-
 ok "Home directory ready: ${RS_HOME}"
 
 # =============================================================================
-# 6. Ansible public key acquisition
+# 5 & 6. Ansible public key acquisition
 #
 # Priority:
 #   A) ANSIBLE_PUBKEY env var (set by deploy.sh — same-host deployment)
@@ -203,12 +189,10 @@ header "Ansible Public Key"
 
 ANSIBLE_PUBKEY_CONTENT=""
 
-# Mode A — passed directly by deploy.sh
 if [[ -n "${ANSIBLE_PUBKEY:-}" ]]; then
   ANSIBLE_PUBKEY_CONTENT="$ANSIBLE_PUBKEY"
   ok "Ansible public key received from deploy.sh (same-host mode)"
 
-# Mode B — URL passed by deploy.sh (cross-host, ansible VM already bootstrapped)
 elif [[ -n "${ANSIBLE_KEY_URL:-}" ]]; then
   info "Fetching Ansible public key from ${ANSIBLE_KEY_URL}..."
   ANSIBLE_PUBKEY_CONTENT=$(curl -fsSL --max-time 15 "$ANSIBLE_KEY_URL" 2>/dev/null || true)
@@ -219,14 +203,12 @@ elif [[ -n "${ANSIBLE_KEY_URL:-}" ]]; then
   fi
 fi
 
-# Mode C / D — interactive
 if [[ -z "$ANSIBLE_PUBKEY_CONTENT" ]]; then
   echo ""
   echo -e "${BOLD}${YELLOW}Ansible public key needed${RESET}"
   echo "  The Ansible Controller VM printed a key server URL when ansible.sh ran."
   echo "  Example: http://10.15.140.100:${KEY_SERVER_PORT}/ansible_ridestatus.pub"
   echo ""
-  echo "  Option 1 — Paste the key server URL (recommended):"
   read -rp "$(echo -e "${BOLD}  Key server URL (or press Enter to paste key manually): ${RESET}")" key_url
 
   if [[ -n "$key_url" ]]; then
@@ -239,34 +221,26 @@ if [[ -z "$ANSIBLE_PUBKEY_CONTENT" ]]; then
     fi
   fi
 
-  # Mode D — manual paste
   if [[ -z "$ANSIBLE_PUBKEY_CONTENT" ]]; then
     echo ""
-    echo -e "${BOLD}  Paste the Ansible public key below (single line, starts with 'ssh-ed25519'):${RESET}"
+    echo -e "${BOLD}  Paste the Ansible public key (single line, starts with 'ssh-ed25519'):${RESET}"
     while true; do
       read -rp "  Public key: " ANSIBLE_PUBKEY_CONTENT
-      if echo "$ANSIBLE_PUBKEY_CONTENT" | grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2) '; then
-        break
-      fi
+      echo "$ANSIBLE_PUBKEY_CONTENT" | grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2) ' && break
       warn "  Does not look like a valid public key — try again."
     done
   fi
 fi
 
-# Validate final key
 echo "$ANSIBLE_PUBKEY_CONTENT" | grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2) ' \
   || die "Ansible public key is invalid or empty"
 
-# Store the key
 echo "$ANSIBLE_PUBKEY_CONTENT" > "$ANSIBLE_PUBKEY_FILE"
 chmod 644 "$ANSIBLE_PUBKEY_FILE"
 chown "${RS_USER}:${RS_USER}" "$ANSIBLE_PUBKEY_FILE"
 
-# Add to authorized_keys so Ansible can SSH in as ridestatus
 AUTH_KEYS="${RS_HOME}/.ssh/authorized_keys"
-touch "$AUTH_KEYS"
-chmod 600 "$AUTH_KEYS"
-chown "${RS_USER}:${RS_USER}" "$AUTH_KEYS"
+touch "$AUTH_KEYS"; chmod 600 "$AUTH_KEYS"; chown "${RS_USER}:${RS_USER}" "$AUTH_KEYS"
 
 if grep -qF "$ANSIBLE_PUBKEY_CONTENT" "$AUTH_KEYS" 2>/dev/null; then
   info "Ansible public key already in authorized_keys"
@@ -274,56 +248,53 @@ else
   echo "$ANSIBLE_PUBKEY_CONTENT" >> "$AUTH_KEYS"
   ok "Ansible public key added to ${AUTH_KEYS}"
 fi
-
 ok "Ansible key stored: ${ANSIBLE_PUBKEY_FILE}"
 
 # =============================================================================
 # 7. Park configuration — interactive, writes .env
-# Only prompts if .env doesn't already exist (idempotent re-runs skip this).
+# Skipped on re-run if .env already exists.
 # =============================================================================
 header "Park Configuration"
 
 if [[ -f "$ENV_FILE" ]]; then
-  info ".env already exists at ${ENV_FILE} — leaving intact"
-  info "To reconfigure: rm ${ENV_FILE} and re-run"
+  info ".env already exists — leaving intact (rm ${ENV_FILE} to reconfigure)"
   source "$ENV_FILE"
 else
-  info "Collecting park configuration — this writes ${ENV_FILE}"
+  info "Collecting park configuration — writes ${ENV_FILE}"
   echo ""
 
   prompt_required PARK_NAME     "Park name (e.g. Six Flags Great America)"
   prompt_default  PARK_TIMEZONE "Timezone" "America/Chicago"
 
   echo ""
-  info "PostgreSQL credentials (database will be created with these)"
-  prompt_default  POSTGRES_DB   "PostgreSQL database name" "ridestatus"
-  prompt_default  POSTGRES_USER "PostgreSQL username"      "ridestatus"
-
-  # Generate a random password if tech just hits Enter
+  info "PostgreSQL credentials"
+  prompt_default POSTGRES_DB   "Database name" "ridestatus"
+  prompt_default POSTGRES_USER "Username"      "ridestatus"
   local_pg_pass=$(tr -dc 'A-Za-z0-9_' < /dev/urandom | head -c 32 || true)
-  prompt_default  POSTGRES_PASS "PostgreSQL password (Enter to generate)" "$local_pg_pass"
+  prompt_default POSTGRES_PASS "Password (Enter to generate)" "$local_pg_pass"
 
   echo ""
   info "API settings"
   local_api_key=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 48 || true)
-  prompt_default  API_PORT "API port" "3100"
-  prompt_default  API_KEY  "API key (Enter to generate)" "$local_api_key"
+  prompt_default API_PORT "API port" "3100"
+  prompt_default API_KEY  "API key (Enter to generate)" "$local_api_key"
 
-  # Bootstrap token — 8 chars max, shown in admin UI, edge nodes use during enrollment
   local_bt=$(tr -dc 'A-Z0-9' < /dev/urandom | head -c 8 || true)
-  prompt_default  SERVER_BOOTSTRAP_TOKEN "Edge enrollment token (max 8 chars)" "$local_bt"
+  prompt_default SERVER_BOOTSTRAP_TOKEN "Edge enrollment token (max 8 chars)" "$local_bt"
   SERVER_BOOTSTRAP_TOKEN="${SERVER_BOOTSTRAP_TOKEN:0:8}"
 
   echo ""
-  info "NIC interface names (check with: ip -o link show)"
-  prompt_default  DEPT_NIC_INTERFACE     "Dept/RideStatus network NIC" "ens18"
-  prompt_default  EXTERNAL_NIC_INTERFACE "Corporate/external NIC"      "ens19"
+  info "NIC interfaces — shown below for reference:"
+  ip -o link show | awk -F': ' '{print "  "$2}' | grep -v lo
+  echo ""
+  prompt_default DEPT_NIC_INTERFACE     "Dept/RideStatus network NIC" "ens18"
+  prompt_default EXTERNAL_NIC_INTERFACE "Corporate/external NIC"      "ens19"
 
   echo ""
   info "Optional: weather and alerting (leave blank to configure later)"
-  prompt_default  WEATHER_API_KEY ""  ""
-  prompt_default  WEATHER_ZIP     "Weather ZIP code" ""
-  prompt_default  ALERT_EMAIL     "Alert email address" ""
+  prompt_default WEATHER_API_KEY "" ""
+  prompt_default WEATHER_ZIP     "Weather ZIP code" ""
+  prompt_default ALERT_EMAIL     "Alert email address" ""
 
   cat > "$ENV_FILE" << EOF
 # =============================================================================
@@ -371,24 +342,73 @@ EOF
   chmod 600 "$ENV_FILE"
   chown "${RS_USER}:${RS_USER}" "$ENV_FILE"
   ok ".env written to ${ENV_FILE}"
-
-  # Source it so the rest of the script can use the vars
   source "$ENV_FILE"
 fi
 
 # =============================================================================
-# 8. PostgreSQL — create user and database
+# 8. Chrony — configured AFTER park config so we know DEPT_NIC_INTERFACE
+#
+# Derives the actual dept subnet from the NIC's IP address and prefix length,
+# scoping the chrony 'allow' directive precisely. Falls back to 10.0.0.0/8
+# if the NIC isn't up yet (shouldn't happen — cloud-init configured it).
+# =============================================================================
+header "Configuring NTP (chrony)"
+
+DEPT_SUBNET=$(dept_nic_subnet "${DEPT_NIC_INTERFACE:-ens18}" || true)
+
+if [[ -z "$DEPT_SUBNET" ]]; then
+  warn "Could not determine subnet for ${DEPT_NIC_INTERFACE} — using 10.0.0.0/8 fallback"
+  warn "Edit /etc/chrony/chrony.conf 'allow' line to match your actual dept subnet"
+  DEPT_SUBNET="10.0.0.0/8"
+else
+  ok "Dept NIC subnet: ${DEPT_SUBNET} (chrony will allow NTP from this range)"
+fi
+
+cat > /etc/chrony/chrony.conf << EOF
+# RideStatus Aggregation Server — chrony config
+# Generated by server.sh — $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+#
+# Syncs from internet NTP pool (stratum 2).
+# Edge nodes on the dept network sync from this VM (stratum 3).
+# Dept subnet (${DEPT_NIC_INTERFACE}): ${DEPT_SUBNET}
+
+pool pool.ntp.org iburst minpoll 6 maxpoll 10
+
+# Allow NTP clients on the dept/RideStatus network only
+allow ${DEPT_SUBNET}
+
+# Serve time even if not yet synced (edge nodes may boot before we do)
+local stratum 3
+
+makestep 1.0 3
+rtcsync
+driftfile /var/lib/chrony/drift
+logdir /var/log/chrony
+EOF
+
+systemctl enable chrony
+systemctl restart chrony
+
+for i in $(seq 1 6); do
+  chronyc tracking 2>/dev/null | grep -q 'Leap status.*Normal' && break
+  sleep 5
+done
+chronyc tracking | grep 'Leap status' \
+  || warn "chrony not yet synced — may need internet route on ${EXTERNAL_NIC_INTERFACE:-ens19}"
+
+ok "chrony configured (allow ${DEPT_SUBNET})"
+
+# =============================================================================
+# 9. PostgreSQL — create user and database
 # =============================================================================
 header "Configuring PostgreSQL"
 
-# Create user (ignore error if already exists)
 sudo -u postgres psql -tc \
   "SELECT 1 FROM pg_roles WHERE rolname='${POSTGRES_USER}'" \
   | grep -q 1 || \
   sudo -u postgres psql -c \
     "CREATE USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASS}';"
 
-# Create database (ignore error if already exists)
 sudo -u postgres psql -tc \
   "SELECT 1 FROM pg_database WHERE datname='${POSTGRES_DB}'" \
   | grep -q 1 || \
@@ -398,7 +418,7 @@ sudo -u postgres psql -tc \
 ok "PostgreSQL user '${POSTGRES_USER}' and database '${POSTGRES_DB}' ready"
 
 # =============================================================================
-# 9. Clone ridestatus-server, install deps, run migrations
+# 10. Clone ridestatus-server, install deps, run migrations
 # =============================================================================
 header "Deploying ridestatus-server"
 
@@ -410,31 +430,26 @@ else
   ok "Repo cloned to ${APP_DIR}"
 fi
 
-# Install npm dependencies
 info "Installing npm dependencies..."
 sudo -u "$RS_USER" bash -c "cd ${APP_DIR} && npm ci --omit=dev --silent"
 ok "npm dependencies installed"
 
-# Copy .env into app directory (app reads from cwd/.env)
 ln -sf "$ENV_FILE" "${APP_DIR}/.env"
 chown -h "${RS_USER}:${RS_USER}" "${APP_DIR}/.env"
 
-# Create logs directory if not present
 mkdir -p "$LOG_DIR"
 chown "${RS_USER}:${RS_USER}" "$LOG_DIR"
 
-# Run database migrations
 info "Running database migrations..."
 sudo -u "$RS_USER" bash -c "cd ${APP_DIR} && node db/migrate.js" \
   && ok "Migrations complete" \
-  || die "Database migration failed — check ${LOG_DIR}/server-err.log"
+  || die "Migration failed — check ${LOG_DIR}/server-err.log"
 
 # =============================================================================
-# 10. PM2 — install, start app, configure startup
+# 11. PM2
 # =============================================================================
 header "Configuring PM2"
 
-# Install PM2 globally if not present or outdated
 if ! command -v pm2 &>/dev/null; then
   npm install -g pm2 --silent
   ok "PM2 installed"
@@ -442,7 +457,6 @@ else
   info "PM2 already installed ($(pm2 --version))"
 fi
 
-# Start or reload the app
 if sudo -u "$RS_USER" pm2 describe ridestatus-server &>/dev/null; then
   info "PM2 process exists — reloading"
   sudo -u "$RS_USER" bash -c "cd ${APP_DIR} && pm2 reload ecosystem.config.js"
@@ -451,33 +465,31 @@ else
   ok "PM2 process started"
 fi
 
-# Save process list and configure startup
 sudo -u "$RS_USER" pm2 save
 
-# Generate and install the systemd startup hook
 pm2 startup systemd -u "$RS_USER" --hp "$RS_HOME" \
   | tail -n 1 | bash 2>/dev/null || true
 systemctl enable "pm2-${RS_USER}" 2>/dev/null || true
 
-ok "PM2 startup configured (ridestatus-server survives reboots)"
+ok "PM2 startup configured"
 
 # =============================================================================
-# 11. UFW firewall
+# 12. UFW firewall
+# NTP (123/udp) is scoped to the dept subnet — same subnet chrony allows.
 # =============================================================================
 header "Configuring Firewall"
 
 ufw --force reset >/dev/null
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow ssh                              comment "Admin SSH"
-ufw allow "${API_PORT:-3100}/tcp"         comment "RideStatus API (edge nodes + Ansible)"
-ufw allow 3000/tcp                         comment "RideStatus board UI"
-ufw allow 123/udp                          comment "NTP — edge nodes sync from this VM"
-# PostgreSQL is localhost-only by default (no ufw rule needed)
-# To allow Ansible direct DB access from the Ansible VM, add:
-#   ufw allow from <ansible-vm-ip> to any port 5432
+ufw allow ssh                                            comment "Admin SSH"
+ufw allow "${API_PORT:-3100}/tcp"                       comment "RideStatus API"
+ufw allow 3000/tcp                                       comment "RideStatus board UI"
+ufw allow from "${DEPT_SUBNET}" to any port 123 proto udp \
+                                                         comment "NTP — dept network only"
 ufw --force enable
-ok "Firewall configured"
+
+ok "Firewall configured (NTP restricted to ${DEPT_SUBNET})"
 
 # =============================================================================
 # Done
@@ -487,6 +499,7 @@ header "Server Bootstrap Complete"
 ok "Node.js:      $(node --version)"
 ok "PostgreSQL:   $(psql --version | awk '{print $3}')"
 ok "PM2:          $(pm2 --version)"
+ok "Dept subnet:  ${DEPT_SUBNET}"
 ok "App:          ${APP_DIR}"
 ok "Config:       ${ENV_FILE}"
 ok "Ansible key:  ${ANSIBLE_PUBKEY_FILE}"
@@ -497,9 +510,12 @@ echo -e "${BOLD}${GREEN}╔═════════════════�
 echo -e "${BOLD}${GREEN}║              RideStatus Server Ready                        ║${RESET}"
 echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════╣${RESET}"
 echo -e "${BOLD}${GREEN}║                                                              ║${RESET}"
-echo -e "${BOLD}${GREEN}║  API:              http://$(hostname -I | awk '{print $1}'):${API_PORT:-3100}${RESET}"
-echo -e "${BOLD}${GREEN}║  Board UI:         http://$(hostname -I | awk '{print $1}'):3000${RESET}"
-echo -e "${BOLD}${GREEN}║  Enrollment token: ${SERVER_BOOTSTRAP_TOKEN}${RESET}"
+printf "${BOLD}${GREEN}║  API:              http://%-36s║${RESET}\n" \
+  "$(ip -4 addr show dev "${DEPT_NIC_INTERFACE:-ens18}" | grep -o 'inet [0-9.]*' | awk '{print $2}'):${API_PORT:-3100}"
+printf "${BOLD}${GREEN}║  Board UI:         http://%-36s║${RESET}\n" \
+  "$(ip -4 addr show dev "${DEPT_NIC_INTERFACE:-ens18}" | grep -o 'inet [0-9.]*' | awk '{print $2}'):3000"
+echo -e "${BOLD}${GREEN}║  Enrollment token: ${SERVER_BOOTSTRAP_TOKEN}$(printf '%*s' $((44 - ${#SERVER_BOOTSTRAP_TOKEN})) '')║${RESET}"
+echo -e "${BOLD}${GREEN}║  Dept NTP subnet:  ${DEPT_SUBNET}$(printf '%*s' $((44 - ${#DEPT_SUBNET})) '')║${RESET}"
 echo -e "${BOLD}${GREEN}║                                                              ║${RESET}"
 echo -e "${BOLD}${GREEN}║  Next: run bootstrap/edge-init.sh on each ride edge node    ║${RESET}"
 echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${RESET}"
