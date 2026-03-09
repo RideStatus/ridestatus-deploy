@@ -354,8 +354,7 @@ configure_vm_nics() {
       local b_idx=0
       pick_menu b_idx "Which bridge?" "${bridge_opts[@]}"
 
-      # ${#EXISTING_BRIDGES[@]} is always valid — :-0 default is not valid syntax
-      # for array length expressions and is not needed since the array is always defined.
+      # ${#EXISTING_BRIDGES[@]} is always valid — array is always defined.
       local existing_count=${#EXISTING_BRIDGES[@]}
       if (( b_idx < existing_count )); then
         bridge_name=${EXISTING_BRIDGES[$b_idx]}
@@ -488,7 +487,33 @@ if $CREATE_ANSIBLE; then
   prompt_default ANSIBLE_HOST  "Ansible VM hostname"  "ridestatus-ansible"
 fi
 
-prompt_required ADMIN_SSH_PUBKEY "Admin SSH public key (added to all VMs alongside deploy key)"
+# =============================================================================
+# Admin SSH key
+#
+# The tech can paste an existing public key, or press Enter to have the script
+# generate a new ed25519 keypair saved on this Proxmox host. The private key
+# can then be copied to a Windows PC via WinSCP or similar.
+# =============================================================================
+header "Admin SSH Key"
+
+ADMIN_KEY_PATH="/root/ridestatus-admin-key"
+ADMIN_GENERATED=false
+
+echo -e "${BOLD}Paste your SSH public key below, or press Enter to generate one automatically.${RESET}"
+echo -e "(A generated key will be saved to ${ADMIN_KEY_PATH} on this Proxmox host)"
+read -rp "$(echo -e "${BOLD}SSH public key${RESET} [press Enter to generate]: ")" ADMIN_SSH_PUBKEY
+
+if [[ -z "$ADMIN_SSH_PUBKEY" ]]; then
+  if [[ -f "${ADMIN_KEY_PATH}.pub" ]]; then
+    ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
+    ok "Using existing admin key at ${ADMIN_KEY_PATH}"
+  else
+    ssh-keygen -t ed25519 -f "$ADMIN_KEY_PATH" -N "" -C "ridestatus-admin" -q
+    ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
+    ADMIN_GENERATED=true
+    ok "Admin keypair generated and saved to ${ADMIN_KEY_PATH}"
+  fi
+fi
 
 # =============================================================================
 # Summary
@@ -523,6 +548,14 @@ $CREATE_ANSIBLE && print_vm_summary "Ansible Controller" "$ANSIBLE_VMID" "$ANSIB
   "$ANSIBLE_RAM" "$ANSIBLE_CORES" "$ANSIBLE_DISK" \
   ANSIBLE_NICS_TYPE ANSIBLE_NICS_LABEL ANSIBLE_NICS_BRIDGE \
   ANSIBLE_NICS_USB  ANSIBLE_NICS_MAC   ANSIBLE_NICS_IP ANSIBLE_NICS_GW
+
+echo ""
+if $ADMIN_GENERATED; then
+  info "Admin SSH key: ${ADMIN_KEY_PATH} (private) — copy to your PC after deployment"
+  info "              ${ADMIN_KEY_PATH}.pub (public)"
+else
+  info "Admin SSH key: provided by operator"
+fi
 
 echo ""
 warn "This will create VMs and modify Proxmox network configuration."
@@ -911,4 +944,12 @@ info "Next steps:"
 info "  1. Verify VMs are accessible in the Proxmox web UI"
 info "  2. SSH to each VM as ridestatus@<ip> using your admin key"
 info "  3. Run bootstrap/edge-init.sh on each ride edge node"
+if $ADMIN_GENERATED; then
+  echo ""
+  warn "*** IMPORTANT: Copy your admin SSH private key off this Proxmox host ***"
+  warn "    Private key : ${ADMIN_KEY_PATH}"
+  warn "    Public key  : ${ADMIN_KEY_PATH}.pub"
+  warn "    Use WinSCP or similar to download ${ADMIN_KEY_PATH} to your PC."
+  warn "    In PuTTY/WinSCP, convert it with PuTTYgen if needed (File > Load, Save private key as .ppk)"
+fi
 echo ""
