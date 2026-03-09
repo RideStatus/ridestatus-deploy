@@ -1,0 +1,44 @@
+---
+# =============================================================================
+# Playbook: update
+# Pulls latest code + runs npm ci + reloads PM2.
+# Does NOT touch .env — use deploy.yml to push config changes.
+#
+# Usage:
+#   ansible-playbook playbooks/update.yml
+#   ansible-playbook playbooks/update.yml --limit goliath
+#   ansible-playbook playbooks/update.yml --limit goliath,batman
+#
+# Update order: run with --serial 1 to roll out one node at a time.
+#   ansible-playbook playbooks/update.yml --serial 1
+# =============================================================================
+- name: Update ridestatus-ride code on edge nodes
+  hosts: edge_nodes
+  gather_facts: true
+  serial: "{{ update_serial | default('100%') }}"
+
+  pre_tasks:
+    - name: Verify node is reachable before update
+      ping:
+
+  roles:
+    - role: ridestatus_ride
+      vars:
+        rs_update_env:  false   # Code-only update — leave .env alone
+        rs_pull_code:   true
+        rs_restart_pm2: true
+
+  post_tasks:
+    - name: Wait for poller to stabilise
+      pause:
+        seconds: 5
+
+    - name: Check poller is online
+      become: true
+      become_user: "{{ rs_user }}"
+      command: pm2 describe {{ pm2_poller_name }}
+      register: pm2_check
+      changed_when: false
+      failed_when: "'online' not in pm2_check.stdout"
+      environment:
+        HOME: "{{ rs_home }}"

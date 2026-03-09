@@ -1,0 +1,31 @@
+---
+# =============================================================================
+# RideStatus — Per-Node Variables: Goliath
+# Copy and rename this file for each edge node.
+# Filename must match the host key in hosts.yml or dynamic inventory.
+# =============================================================================
+
+ride_name:  Goliath
+
+# PLC connection
+plc_protocol: enip
+plc_ip:       192.168.1.2
+plc_slot:     0
+
+# Network interfaces (legacy Pi layout)
+ride_nic_interface:       eth0
+ridestatus_nic_interface: eth1
+
+# PLC tag names — uncomment and set only if different from group_vars defaults
+# tag_mode:          ProgramMode
+# tag_fault:         FaultCode
+# tag_fault_message: FaultMessage
+# tag_fault_ts:      FaultTimestamp
+# tag_cycle_count:   TotalCycles
+# tag_cycle_time:    LastCycleTime
+# tag_status_message: StatusMessage
+# tag_rtc:           SystemTime
+
+# Server overrides — only needed if this node talks to a different server
+# ridestatus_server_host: 10.15.140.101
+# ridestatus_server_port: 3100

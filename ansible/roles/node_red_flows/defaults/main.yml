@@ -1,0 +1,8 @@
+---
+# Source flows.json path on the Ansible controller.
+# Override at playbook level: -e flows_src=/path/to/flows.json
+flows_src: "{{ playbook_dir }}/../config/flows.json"
+
+# Whether to also push settings.js alongside flows.json
+push_settings: false
+settings_src:  "{{ playbook_dir }}/../config/node-red-settings.js"

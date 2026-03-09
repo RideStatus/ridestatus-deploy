@@ -1,0 +1,7 @@
+---
+- name: restart rs-nodered
+  become: true
+  become_user: "{{ rs_user }}"
+  command: pm2 restart {{ pm2_nodered_name }}
+  environment:
+    HOME: "{{ rs_home }}"

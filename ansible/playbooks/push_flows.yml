@@ -1,0 +1,26 @@
+---
+# =============================================================================
+# Playbook: push_flows
+# Pushes Node-RED flows.json to edge nodes and restarts rs-nodered.
+# Only restarts if the file actually changed (copy module is idempotent).
+#
+# Usage:
+#   # Push to all nodes:
+#   ansible-playbook playbooks/push_flows.yml -e flows_src=/path/to/flows.json
+#
+#   # Push to one node:
+#   ansible-playbook playbooks/push_flows.yml --limit goliath \
+#     -e flows_src=/path/to/flows.json
+#
+#   # Also push settings.js:
+#   ansible-playbook playbooks/push_flows.yml \
+#     -e flows_src=/path/to/flows.json \
+#     -e push_settings=true \
+#     -e settings_src=/path/to/settings.js
+# =============================================================================
+- name: Push Node-RED flows to edge nodes
+  hosts: edge_nodes
+  gather_facts: false
+
+  roles:
+    - role: node_red_flows
