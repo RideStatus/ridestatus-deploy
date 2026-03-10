@@ -14,14 +14,15 @@
 #   The temp key is deleted on exit.
 #
 # Cloud-init approach:
-#   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig)
-#   for user/network/keys, plus a per-VM cicustom user-data snippet written
-#   to /var/lib/vz/snippets/ that installs qemu-guest-agent on first boot.
-#   After all qm set calls are complete, `qm cloudinit update` is called to
-#   rebuild the cloud-init ISO from the current config before the VM starts.
-#   The snippet storage must have 'snippets' content enabled — this script
-#   enables it automatically if missing. pvesh JSON is used throughout for
-#   storage inspection to avoid fragile awk column parsing of pvesm output.
+#   Uses --cicustom user= to supply a full cloud-config snippet written to
+#   /var/lib/vz/snippets/. IMPORTANT: when --cicustom user= is set, Proxmox's
+#   native --ciuser and --sshkeys are silently ignored by cloud-init — the
+#   snippet IS the entire user-data. Therefore the snippet must handle user
+#   creation, SSH key injection, AND qemu-guest-agent installation.
+#   Network config (--ipconfig, --nameserver) lives in a separate Proxmox
+#   "network-data" section and is NOT affected by --cicustom user=.
+#   After all qm set calls, `qm cloudinit update` rebuilds the ISO before
+#   the VM starts. pvesh JSON is used throughout for storage inspection.
 #
 # USB NIC naming:
 #   After each VM boots, the QEMU guest agent is queried for real NIC names.
@@ -215,7 +216,6 @@ ADMIN_KEY_PATH="/root/ridestatus-admin-key"
 
 cleanup() {
   rm -rf "$DEPLOY_KEY_DIR"
-  rm -f /tmp/ridestatus-sshkeys-*.txt 2>/dev/null || true
   rm -f "${SNIPPET_DIR}/ridestatus-userdata-"*.yaml 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -679,15 +679,31 @@ ensure_ubuntu_image() {
 
 # =============================================================================
 # Helper: write cloud-init user-data snippet for a VM
+#
+# When --cicustom user= is set, Proxmox's --ciuser and --sshkeys are completely
+# ignored by cloud-init — the snippet IS the entire user-data section. So this
+# snippet must handle user creation, SSH authorized_keys, sudo, AND package
+# installation. Network config (--ipconfig, --nameserver) is unaffected because
+# it lives in a separate Proxmox-managed network-data section.
 # =============================================================================
 write_userdata_snippet() {
-  local vmid=$1
+  local vmid=$1 deploy_key=$2 admin_key=$3
   local snippet_file="${SNIPPET_DIR}/ridestatus-userdata-${vmid}.yaml"
 
-  cat > "$snippet_file" <<'YAML'
+  cat > "$snippet_file" <<YAML
 #cloud-config
+users:
+  - name: ridestatus
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${deploy_key}
+      - ${admin_key}
+
 packages:
   - qemu-guest-agent
+
 runcmd:
   - systemctl enable qemu-guest-agent
   - systemctl start qemu-guest-agent
@@ -701,8 +717,10 @@ YAML
 #
 # IMPORTANT: All qm set calls must complete BEFORE qm cloudinit update, which
 # rebuilds the cloud-init ISO from the current VM config. The VM is only
-# started after the ISO is up to date — otherwise cloud-init boots with a
-# stale ISO that may be missing keys, network config, or the cicustom snippet.
+# started after the ISO is up to date.
+#
+# NOTE: --ciuser and --sshkeys are NOT set here because --cicustom user= makes
+# them irrelevant. The snippet handles user creation and key injection instead.
 #
 # NOTE: All counter increments use x=$(( x+1 )) rather than (( x++ )) because
 # under set -e, (( expr )) exits with code 1 when the expression evaluates to
@@ -752,13 +770,7 @@ create_vm() {
   # Cloud-init drive
   qm set "$vmid" --ide2 "${CI_STORAGE}:cloudinit"
 
-  # SSH keys — both the temp deploy key and the admin key
-  local sshkeys_file="/tmp/ridestatus-sshkeys-${vmid}.txt"
-  printf '%s\n%s\n' "$DEPLOY_PUBKEY_CONTENT" "$ADMIN_SSH_PUBKEY" > "$sshkeys_file"
-  qm set "$vmid" --ciuser ridestatus --sshkeys "$sshkeys_file"
-  rm -f "$sshkeys_file"
-
-  # Network config (bridge NICs only; USB NICs patched post-boot via guest agent)
+  # Network config (unaffected by cicustom user=)
   local ipconfig_idx=0
   for i in "${!cv_type[@]}"; do
     [[ "${cv_type[$i]}" != "bridge" ]] && continue
@@ -772,15 +784,14 @@ create_vm() {
   qm set "$vmid" --nameserver "${cv_dns[0]:-8.8.8.8}"
   qm set "$vmid" --ciupgrade 0
 
-  # Write user-data snippet to install qemu-guest-agent on first boot
+  # Write full user-data snippet (user + keys + packages).
+  # DO NOT also set --ciuser/--sshkeys — they are ignored when cicustom user= is active.
   local snippet_file
-  snippet_file=$(write_userdata_snippet "$vmid")
+  snippet_file=$(write_userdata_snippet "$vmid" "$DEPLOY_PUBKEY_CONTENT" "$ADMIN_SSH_PUBKEY")
   qm set "$vmid" --cicustom "user=${CI_STORAGE}:snippets/$(basename "$snippet_file")"
-  info "Cloud-init user-data snippet: $(basename "$snippet_file")"
+  info "Cloud-init user-data snippet written: $(basename "$snippet_file")"
 
   # Rebuild the cloud-init ISO from current config BEFORE starting the VM.
-  # Without this, qm uses whatever ISO was last written to disk, which may
-  # be missing keys, network config, or the cicustom snippet entirely.
   info "Regenerating cloud-init ISO for VM ${vmid}..."
   qm cloudinit update "$vmid"
   ok "Cloud-init ISO updated for VM ${vmid}"
