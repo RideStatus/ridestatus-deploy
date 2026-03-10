@@ -13,8 +13,10 @@
 #
 # Cloud-init approach:
 #   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig).
-#   The cloud-init ISO drive is attached to whichever storage on this host
-#   supports the 'images' content type (detected automatically via pvesm).
+#   The cloud-init ISO drive is attached to a directory-type storage (detected
+#   automatically). The 'images' content type is enabled on that storage if
+#   not already present — required by Proxmox before cloud-init drives can be
+#   created there.
 #   Packages and runcmd are handled by bootstrap scripts after first boot.
 #
 # USB NIC naming:
@@ -102,10 +104,19 @@ info "Proxmox node: ${PROXMOX_NODE}"
 
 # =============================================================================
 # Detect suitable storages for OS disk and cloud-init drive
+#
+# OS disk  → local-lvm (LVM-thin block volumes)
+# CI drive → directory-type storage with 'images' content enabled
+#
+# Proxmox requires the 'images' content type to be explicitly listed in a
+# storage's content config before cloud-init drives can be created there,
+# even for directory-type (dir) storages. We enable it unconditionally on
+# whichever dir storage we select — pvesm set is idempotent and safe.
 # =============================================================================
 header "Detecting Storage"
 
 find_dir_storage() {
+  # Returns the name of a directory-type storage.
   # Preference: local, then first dir-type found.
   if pvesm status --storage "local" &>/dev/null 2>&1; then
     local stype
@@ -123,6 +134,24 @@ find_dir_storage() {
     fi
   done < <(pvesm status 2>/dev/null | awk 'NR>1' || true)
   return 1
+}
+
+ensure_images_content() {
+  # Ensure the given storage has 'images' in its content type list.
+  # Reads current content, appends images if missing, then applies.
+  local storage=$1
+  local current_content
+  current_content=$(pvesm status --storage "$storage" 2>/dev/null \
+    | awk 'NR>1 {print $5}' || true)
+  if echo "$current_content" | grep -q 'images'; then
+    info "Storage '${storage}' already has images content type"
+  else
+    info "Enabling images content type on storage '${storage}'..."
+    local new_content="${current_content:+${current_content},}images"
+    pvesm set "$storage" --content "$new_content" \
+      || die "Failed to enable images content on storage '${storage}'"
+    ok "images content type enabled on '${storage}'"
+  fi
 }
 
 DISK_STORAGE=""
@@ -145,17 +174,11 @@ else
   info "OS disk storage: ${DISK_STORAGE} (local-lvm not found)"
 fi
 
-# Cloud-init drive: needs directory-type storage (not LVM-thin block storage)
+# Cloud-init drive: needs directory-type storage with images content enabled
 CI_STORAGE=$(find_dir_storage || true)
-if [[ -n "$CI_STORAGE" ]]; then
-  info "Cloud-init storage: ${CI_STORAGE}"
-else
-  warn "No directory storage found — enabling images content on 'local'..."
-  pvesm set local --content iso,vztmpl,backup,images 2>/dev/null \
-    && CI_STORAGE="local" \
-    || die "Cannot find or configure a suitable storage for cloud-init drive."
-  ok "Enabled images content on local storage"
-fi
+[[ -n "$CI_STORAGE" ]] || die "No directory-type storage found for cloud-init drive."
+ensure_images_content "$CI_STORAGE"
+info "Cloud-init storage: ${CI_STORAGE}"
 
 # =============================================================================
 # Temporary deploy keypair
