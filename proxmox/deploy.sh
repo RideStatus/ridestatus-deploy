@@ -14,9 +14,10 @@
 # Cloud-init approach:
 #   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig).
 #   The cloud-init ISO drive is attached to a directory-type storage (detected
-#   automatically). The 'images' content type is enabled on that storage if
-#   not already present — required by Proxmox before cloud-init drives can be
-#   created there.
+#   automatically via pvesh JSON). The 'images' content type is enabled on
+#   that storage if not already present — required by Proxmox before cloud-init
+#   drives can be created there. pvesh JSON is used throughout to avoid
+#   fragile awk column parsing of pvesm status text output.
 #   Packages and runcmd are handled by bootstrap scripts after first boot.
 #
 # USB NIC naming:
@@ -84,6 +85,9 @@ confirm() {
 # Helper: read MAC for an interface
 iface_mac() { cat "/sys/class/net/${1}/address" 2>/dev/null || echo "unknown"; }
 
+# Helper: get all storage config as JSON via pvesh (reliable, no awk)
+storage_json() { pvesh get /storage --output-format json 2>/dev/null || echo '[]'; }
+
 # =============================================================================
 # Preflight
 # =============================================================================
@@ -110,48 +114,67 @@ info "Proxmox node: ${PROXMOX_NODE}"
 #
 # Proxmox requires the 'images' content type to be explicitly listed in a
 # storage's content config before cloud-init drives can be created there,
-# even for directory-type (dir) storages. We enable it unconditionally on
-# whichever dir storage we select — pvesm set is idempotent and safe.
+# even for directory-type (dir) storages. We read storage config via
+# pvesh JSON (reliable) rather than awk-parsing pvesm status text columns.
 # =============================================================================
 header "Detecting Storage"
 
-find_dir_storage() {
-  # Returns the name of a directory-type storage.
-  # Preference: local, then first dir-type found.
-  if pvesm status --storage "local" &>/dev/null 2>&1; then
-    local stype
-    stype=$(pvesm status --storage "local" 2>/dev/null | awk 'NR>1 {print $2}' || true)
-    if [[ "$stype" == "dir" ]]; then
-      echo "local"; return 0
-    fi
-  fi
-  while IFS= read -r line; do
-    local name stype
-    name=$(echo "$line" | awk '{print $1}')
-    stype=$(echo "$line" | awk '{print $2}')
-    if [[ "$stype" == "dir" ]]; then
-      echo "$name"; return 0
-    fi
-  done < <(pvesm status 2>/dev/null | awk 'NR>1' || true)
-  return 1
+# get_storage_field STORAGE_NAME FIELD
+# Prints the value of FIELD for the named storage from pvesh JSON output.
+get_storage_field() {
+  local name=$1 field=$2
+  storage_json | python3 -c "
+import sys, json
+for s in json.load(sys.stdin):
+    if s.get('storage') == '${name}':
+        print(s.get('${field}', ''))
+        break
+" 2>/dev/null || true
 }
 
+# find_dir_storage — returns name of first directory-type storage.
+# Prefers 'local'; falls back to first dir-type found.
+find_dir_storage() {
+  storage_json | python3 -c "
+import sys, json
+stores = json.load(sys.stdin)
+# Prefer 'local'
+for s in stores:
+    if s.get('storage') == 'local' and s.get('type') == 'dir':
+        print('local')
+        sys.exit(0)
+# Fall back to first dir-type
+for s in stores:
+    if s.get('type') == 'dir':
+        print(s.get('storage', ''))
+        sys.exit(0)
+" 2>/dev/null || true
+}
+
+# ensure_images_content STORAGE_NAME
+# Adds 'images' to the storage's content list if not already present.
 ensure_images_content() {
-  # Ensure the given storage has 'images' in its content type list.
-  # Reads current content, appends images if missing, then applies.
   local storage=$1
   local current_content
-  current_content=$(pvesm status --storage "$storage" 2>/dev/null \
-    | awk 'NR>1 {print $5}' || true)
+  current_content=$(get_storage_field "$storage" "content")
+
   if echo "$current_content" | grep -q 'images'; then
     info "Storage '${storage}' already has images content type"
-  else
-    info "Enabling images content type on storage '${storage}'..."
-    local new_content="${current_content:+${current_content},}images"
-    pvesm set "$storage" --content "$new_content" \
-      || die "Failed to enable images content on storage '${storage}'"
-    ok "images content type enabled on '${storage}'"
+    return 0
   fi
+
+  info "Enabling images content type on storage '${storage}'..."
+  local new_content
+  if [[ -n "$current_content" ]]; then
+    new_content="${current_content},images"
+  else
+    # Safe default for a standard Proxmox 'local' dir storage
+    new_content="iso,vztmpl,backup,images"
+  fi
+
+  pvesm set "$storage" --content "$new_content" \
+    || die "Failed to enable images content on storage '${storage}'"
+  ok "images content type enabled on '${storage}'"
 }
 
 DISK_STORAGE=""
@@ -162,20 +185,20 @@ if pvesm status --storage "local-lvm" &>/dev/null 2>&1; then
   DISK_STORAGE="local-lvm"
   info "OS disk storage: local-lvm"
 else
-  # Fall back to first images-capable storage
-  while IFS= read -r line; do
-    local_name=$(echo "$line" | awk '{print $1}')
-    local_content=$(echo "$line" | awk '{print $5}')
-    if echo "$local_content" | grep -q 'images'; then
-      DISK_STORAGE="$local_name"; break
-    fi
-  done < <(pvesm status 2>/dev/null | awk 'NR>1' || true)
+  # Fall back to first storage with 'images' in its content list (via JSON)
+  DISK_STORAGE=$(storage_json | python3 -c "
+import sys, json
+for s in json.load(sys.stdin):
+    if 'images' in s.get('content', ''):
+        print(s.get('storage', ''))
+        break
+" 2>/dev/null || true)
   [[ -n "$DISK_STORAGE" ]] || die "No images-capable storage found for OS disk"
   info "OS disk storage: ${DISK_STORAGE} (local-lvm not found)"
 fi
 
-# Cloud-init drive: needs directory-type storage with images content enabled
-CI_STORAGE=$(find_dir_storage || true)
+# Cloud-init drive: directory-type storage with images content enabled
+CI_STORAGE=$(find_dir_storage)
 [[ -n "$CI_STORAGE" ]] || die "No directory-type storage found for cloud-init drive."
 ensure_images_content "$CI_STORAGE"
 info "Cloud-init storage: ${CI_STORAGE}"
