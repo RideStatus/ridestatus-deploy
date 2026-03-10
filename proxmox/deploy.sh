@@ -13,8 +13,8 @@
 #
 # Cloud-init approach:
 #   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig).
-#   The cloud-init ISO drive is attached to 'local' storage (not local-lvm)
-#   because local-lvm is LVM-thin and cannot host cloud-init ISO images.
+#   The cloud-init ISO drive is attached to whichever storage on this host
+#   supports the 'images' content type (detected automatically via pvesm).
 #   Packages and runcmd are handled by bootstrap scripts after first boot.
 #
 # USB NIC naming:
@@ -89,6 +89,7 @@ header "RideStatus Proxmox Deploy"
 
 [[ $EUID -eq 0 ]] || die "This script must be run as root."
 command -v pvesh    >/dev/null 2>&1 || die "pvesh not found — is this a Proxmox host?"
+command -v pvesm    >/dev/null 2>&1 || die "pvesm not found — is this a Proxmox host?"
 command -v qm       >/dev/null 2>&1 || die "qm not found — is this a Proxmox host?"
 command -v lsusb    >/dev/null 2>&1 || die "lsusb not found (apt install usbutils)"
 command -v ssh      >/dev/null 2>&1 || die "ssh not found"
@@ -98,6 +99,96 @@ command -v curl     >/dev/null 2>&1 || die "curl not found"
 
 PROXMOX_NODE=$(hostname)
 info "Proxmox node: ${PROXMOX_NODE}"
+
+# =============================================================================
+# Detect suitable storages for OS disk and cloud-init drive
+#
+# OS disk  → needs 'images' content type + block/file support
+# CI drive → needs 'images' content type (cloud-init ISO is an image file)
+#
+# Proxmox storage types that support images content:
+#   dir, nfs, cifs, glusterfs, zfs, lvm, lvmthin, btrfs, cephfs, rbd
+#
+# We prefer:
+#   OS disk  → local-lvm (LVM-thin, fastest for block I/O) if available,
+#              else first images-capable storage
+#   CI drive → same as OS disk (both accept images content) OR any dir-type
+#              storage (dir storage always works for cloud-init ISOs)
+# =============================================================================
+header "Detecting Storage"
+
+find_images_storage() {
+  # Returns the name of a storage that supports 'images' content.
+  # Preference order: local-lvm, local, then whatever pvesm lists first.
+  local preferred=("local-lvm" "local")
+  for p in "${preferred[@]}"; do
+    if pvesm status --storage "$p" &>/dev/null 2>&1; then
+      local content
+      content=$(pvesm status --storage "$p" 2>/dev/null | awk 'NR>1 {print $5}' || true)
+      if echo "$content" | grep -q 'images'; then
+        echo "$p"; return 0
+      fi
+    fi
+  done
+  # Fall back: scan all storages
+  while IFS= read -r line; do
+    local name content
+    name=$(echo "$line" | awk '{print $1}')
+    content=$(echo "$line" | awk '{print $5}')
+    if echo "$content" | grep -q 'images'; then
+      echo "$name"; return 0
+    fi
+  done < <(pvesm status 2>/dev/null | awk 'NR>1' || true)
+  return 1
+}
+
+find_dir_storage() {
+  # Returns the name of a directory-type storage (best for cloud-init ISO).
+  # Preference: local, then first dir-type found.
+  if pvesm status --storage "local" &>/dev/null 2>&1; then
+    local type
+    type=$(pvesm status --storage "local" 2>/dev/null | awk 'NR>1 {print $2}' || true)
+    if [[ "$type" == "dir" ]]; then
+      echo "local"; return 0
+    fi
+  fi
+  while IFS= read -r line; do
+    local name type
+    name=$(echo "$line" | awk '{print $1}')
+    type=$(echo "$line" | awk '{print $2}')
+    if [[ "$type" == "dir" ]]; then
+      echo "$name"; return 0
+    fi
+  done < <(pvesm status 2>/dev/null | awk 'NR>1' || true)
+  return 1
+}
+
+DISK_STORAGE=""
+CI_STORAGE=""
+
+# OS disk: prefer local-lvm
+if pvesm status --storage "local-lvm" &>/dev/null 2>&1; then
+  DISK_STORAGE="local-lvm"
+  info "OS disk storage: local-lvm"
+else
+  DISK_STORAGE=$(find_images_storage || true)
+  [[ -n "$DISK_STORAGE" ]] || die "No images-capable storage found for OS disk"
+  info "OS disk storage: ${DISK_STORAGE} (local-lvm not found)"
+fi
+
+# Cloud-init drive: needs directory-type storage (not LVM-thin)
+CI_STORAGE=$(find_dir_storage || true)
+if [[ -n "$CI_STORAGE" ]]; then
+  info "Cloud-init storage: ${CI_STORAGE}"
+else
+  # Last resort: enable images content type on local storage if it's dir type
+  warn "No directory storage found for cloud-init drive."
+  warn "Attempting to enable images content on 'local' storage..."
+  pvesm set local --content iso,vztmpl,backup,images 2>/dev/null \
+    && CI_STORAGE="local" \
+    || die "Cannot find or configure a suitable storage for cloud-init drive."
+  ok "Enabled images content on local storage"
+fi
 
 # =============================================================================
 # Temporary deploy keypair
@@ -131,13 +222,6 @@ deploy_ssh() {
 # =============================================================================
 header "Detecting Network Interfaces"
 
-# Exclude:
-#   lo               — loopback
-#   vmbr*            — Proxmox Linux bridges (shown separately below)
-#   tap*, veth*      — VM tap/veth pairs
-#   fwbr*, fwpr*     — Proxmox firewall bridge/patch ports
-#   fwln*            — Proxmox firewall link interfaces
-#   *@*              — any virtual interface with a parent (catches fwln100i0@fwpr100p0 etc.)
 mapfile -t ALL_IFACES < <(
   ip -o link show | awk -F': ' '{print $2}' \
   | grep -v '^lo$' \
@@ -145,8 +229,6 @@ mapfile -t ALL_IFACES < <(
   | grep -Ev '^(vmbr|tap|veth|fwbr|fwpr|fwln)'
 )
 
-# Only show vmbr* bridges as selectable — fwbr/tap/fwpr are internal Proxmox plumbing
-# and should never be used as VM NIC bridges directly.
 mapfile -t EXISTING_BRIDGES < <(
   ip -o link show | awk -F': ' '{print $2}' | grep '^vmbr' | grep -v '@' || true
 )
@@ -465,10 +547,6 @@ fi
 
 # =============================================================================
 # Admin SSH key
-#
-# The tech can paste an existing public key, or press Enter to have the script
-# generate a new ed25519 keypair saved on this Proxmox host. The private key
-# can then be copied to a Windows PC via WinSCP or similar.
 # =============================================================================
 header "Admin SSH Key"
 
@@ -526,6 +604,7 @@ $CREATE_ANSIBLE && print_vm_summary "Ansible Controller" "$ANSIBLE_VMID" "$ANSIB
   ANSIBLE_NICS_USB  ANSIBLE_NICS_MAC   ANSIBLE_NICS_IP ANSIBLE_NICS_GW
 
 echo ""
+info "Storage: OS disk → ${DISK_STORAGE}  |  Cloud-init → ${CI_STORAGE}"
 if $ADMIN_GENERATED; then
   info "Admin SSH key: ${ADMIN_KEY_PATH} (private) — copy to your PC after deployment"
   info "              ${ADMIN_KEY_PATH}.pub (public)"
@@ -576,14 +655,6 @@ ensure_ubuntu_image() {
 
 # =============================================================================
 # Helper: create and configure a VM
-#
-# Disk is imported to local-lvm (block storage, fast I/O).
-# Cloud-init ISO drive is attached to 'local' (directory storage) — local-lvm
-# is LVM-thin and cannot host ISO/cloud-init image files.
-# SSH keys, IP config, and DNS are applied via native qm cloud-init parameters.
-# Packages and runcmd are handled by bootstrap scripts after first boot.
-#
-# USB passthrough uses host=<bus>-<port> (unambiguous with identical NICs).
 # =============================================================================
 create_vm() {
   local vmid=$1 hostname=$2 ram_gb=$3 cores=$4 disk_gb=$5
@@ -591,19 +662,17 @@ create_vm() {
 
   info "Creating VM ${vmid} (${hostname})..."
   local ram_mb=$(( ram_gb * 1024 ))
-  local disk_storage="local-lvm"   # LVM-thin: block volumes (OS disk)
-  local ci_storage="local"         # Directory storage: ISO/cloud-init images
 
   qm create "$vmid" --name "$hostname" --memory "$ram_mb" --cores "$cores" \
     --cpu cputype=host --ostype l26 --agent enabled=1 --serial0 socket --vga serial0
 
   local img_copy="/tmp/ridestatus-vm${vmid}.img"
   cp "$UBUNTU_IMG_PATH" "$img_copy"
-  qm importdisk "$vmid" "$img_copy" "$disk_storage" --format qcow2
+  qm importdisk "$vmid" "$img_copy" "$DISK_STORAGE" --format qcow2
   rm -f "$img_copy"
 
   qm set "$vmid" --scsihw virtio-scsi-pci \
-    --scsi0 "${disk_storage}:vm-${vmid}-disk-0,discard=on" --boot order=scsi0
+    --scsi0 "${DISK_STORAGE}:vm-${vmid}-disk-0,discard=on" --boot order=scsi0
   qm resize "$vmid" scsi0 "${disk_gb}G"
 
   # Attach NICs
@@ -628,16 +697,16 @@ create_vm() {
     fi
   done
 
-  # Cloud-init drive: must use directory-based storage (not LVM-thin)
-  qm set "$vmid" --ide2 "${ci_storage}:cloudinit"
+  # Cloud-init drive on directory-type storage
+  qm set "$vmid" --ide2 "${CI_STORAGE}:cloudinit"
 
-  # SSH keys: qm requires a file path
+  # SSH keys
   local sshkeys_file="/tmp/ridestatus-sshkeys-${vmid}.txt"
   printf '%s\n%s\n' "$DEPLOY_PUBKEY_CONTENT" "$ADMIN_SSH_PUBKEY" > "$sshkeys_file"
   qm set "$vmid" --ciuser ridestatus --sshkeys "$sshkeys_file"
   rm -f "$sshkeys_file"
 
-  # Network: ipconfig index matches bridge NIC index (USB NICs patched later via guest agent)
+  # Network config (bridge NICs only; USB NICs patched post-boot via guest agent)
   local ipconfig_idx=0
   for i in "${!cv_type[@]}"; do
     [[ "${cv_type[$i]}" != "bridge" ]] && continue
@@ -648,7 +717,6 @@ create_vm() {
     (( ipconfig_idx++ ))
   done
 
-  # DNS and hostname
   qm set "$vmid" --nameserver "${cv_dns[0]:-8.8.8.8}"
   qm set "$vmid" --ciupgrade 0
 
