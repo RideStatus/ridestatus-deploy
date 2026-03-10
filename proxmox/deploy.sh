@@ -9,7 +9,9 @@
 # SSH approach:
 #   A temporary ed25519 keypair is generated at startup and injected into
 #   cloud-init alongside the tech's admin key. The script uses the temp key
-#   exclusively for bootstrap SSH connections, then deletes it on exit.
+#   for bootstrap SSH connections, falling back to the admin key if needed
+#   (e.g. when re-running against VMs already booted from a prior run).
+#   The temp key is deleted on exit.
 #
 # Cloud-init approach:
 #   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig)
@@ -199,11 +201,6 @@ ensure_content_type "$CI_STORAGE" "images"
 ensure_content_type "$CI_STORAGE" "snippets"
 info "Cloud-init / snippets storage: ${CI_STORAGE}"
 
-# Snippet directory path for this storage (always /var/lib/vz/snippets for 'local')
-SNIPPET_DIR=$(pvesm path "${CI_STORAGE}:snippets" 2>/dev/null \
-  | xargs dirname 2>/dev/null || echo "/var/lib/vz/snippets")
-# pvesm path gives the full file path; we want the directory
-# For 'local' this is always /var/lib/vz/snippets
 SNIPPET_DIR="/var/lib/vz/snippets"
 mkdir -p "$SNIPPET_DIR"
 
@@ -218,22 +215,39 @@ ssh-keygen -t ed25519 -f "$DEPLOY_KEY" -N "" -C "ridestatus-deploy-temp" -q
 DEPLOY_PUBKEY_CONTENT=$(cat "$DEPLOY_PUBKEY")
 ok "Temporary deploy keypair generated (deleted on exit)"
 
+# ADMIN_KEY_PATH is set later after the admin key prompt, but we reference it
+# in deploy_ssh — declare it here so the function can use its final value.
+ADMIN_KEY_PATH="/root/ridestatus-admin-key"
+
 cleanup() {
   rm -rf "$DEPLOY_KEY_DIR"
   rm -f /tmp/ridestatus-sshkeys-*.txt 2>/dev/null || true
-  # Snippet files are also cleaned up — they're only needed at first boot
   rm -f "${SNIPPET_DIR}/ridestatus-userdata-"*.yaml 2>/dev/null || true
 }
 trap cleanup EXIT
 
+# deploy_ssh IP [CMD...]
+# Tries the temporary deploy key first; falls back to the admin key.
+# This handles re-runs where the VMs already booted with a prior deploy key
+# but both keys are always injected into cloud-init authorized_keys.
 deploy_ssh() {
   local ip=$1; shift
-  ssh -i "$DEPLOY_KEY" \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile=/dev/null \
-      -o ConnectTimeout=5 \
-      -o BatchMode=yes \
-      "ridestatus@${ip}" "$@"
+  local ssh_opts=(
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ConnectTimeout=5
+    -o BatchMode=yes
+  )
+  # Try deploy key first (fast path for fresh VMs)
+  if ssh -i "$DEPLOY_KEY" "${ssh_opts[@]}" "ridestatus@${ip}" "$@" 2>/dev/null; then
+    return 0
+  fi
+  # Fall back to admin key (handles re-runs against already-running VMs)
+  if [[ -f "$ADMIN_KEY_PATH" ]]; then
+    ssh -i "$ADMIN_KEY_PATH" "${ssh_opts[@]}" "ridestatus@${ip}" "$@"
+    return $?
+  fi
+  return 1
 }
 
 # =============================================================================
@@ -571,7 +585,6 @@ fi
 # =============================================================================
 header "Admin SSH Key"
 
-ADMIN_KEY_PATH="/root/ridestatus-admin-key"
 ADMIN_GENERATED=false
 
 echo -e "${BOLD}Paste your SSH public key below, or press Enter to generate one automatically.${RESET}"
@@ -681,10 +694,6 @@ ensure_ubuntu_image() {
 # and network setup but do NOT install packages. We use a cicustom user-data
 # snippet to install qemu-guest-agent on first boot so the guest agent is
 # available for deploy.sh to poll after the VM starts.
-#
-# The snippet is a minimal cloud-config written to the Proxmox snippets dir
-# and referenced via --cicustom "user=<storage>:snippets/<file>".
-# It is deleted on script exit (cleanup trap).
 # =============================================================================
 write_userdata_snippet() {
   local vmid=$1
@@ -753,7 +762,7 @@ create_vm() {
   # Cloud-init drive
   qm set "$vmid" --ide2 "${CI_STORAGE}:cloudinit"
 
-  # SSH keys
+  # SSH keys — both the temp deploy key and the admin key
   local sshkeys_file="/tmp/ridestatus-sshkeys-${vmid}.txt"
   printf '%s\n%s\n' "$DEPLOY_PUBKEY_CONTENT" "$ADMIN_SSH_PUBKEY" > "$sshkeys_file"
   qm set "$vmid" --ciuser ridestatus --sshkeys "$sshkeys_file"
@@ -881,6 +890,7 @@ first_ip() { local -n _fi=$1; echo "${_fi[0]%%/*}"; }
 
 # =============================================================================
 # Helper: wait for SSH
+# Tries deploy_ssh (which itself tries deploy key then admin key fallback).
 # =============================================================================
 wait_for_ssh() {
   local ip=$1 max_wait=300 elapsed=0
