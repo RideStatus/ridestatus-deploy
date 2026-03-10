@@ -12,13 +12,12 @@
 #   exclusively for bootstrap SSH connections, then deletes it on exit.
 #
 # Cloud-init approach:
-#   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig).
-#   The cloud-init ISO drive is attached to a directory-type storage (detected
-#   automatically via pvesh JSON). The 'images' content type is enabled on
-#   that storage if not already present — required by Proxmox before cloud-init
-#   drives can be created there. pvesh JSON is used throughout to avoid
-#   fragile awk column parsing of pvesm status text output.
-#   Packages and runcmd are handled by bootstrap scripts after first boot.
+#   Uses native qm cloud-init parameters (--ciuser, --sshkeys, --ipconfig)
+#   for user/network/keys, plus a per-VM cicustom user-data snippet written
+#   to /var/lib/vz/snippets/ that installs qemu-guest-agent on first boot.
+#   The snippet storage must have 'snippets' content enabled — this script
+#   enables it automatically if missing. pvesh JSON is used throughout for
+#   storage inspection to avoid fragile awk column parsing of pvesm output.
 #
 # USB NIC naming:
 #   After each VM boots, the QEMU guest agent is queried for real NIC names.
@@ -107,15 +106,15 @@ PROXMOX_NODE=$(hostname)
 info "Proxmox node: ${PROXMOX_NODE}"
 
 # =============================================================================
-# Detect suitable storages for OS disk and cloud-init drive
+# Detect suitable storages for OS disk, cloud-init drive, and snippets
 #
-# OS disk  → local-lvm (LVM-thin block volumes)
-# CI drive → directory-type storage with 'images' content enabled
+# OS disk    → local-lvm (LVM-thin block volumes)
+# CI drive   → directory-type storage with 'images' content enabled
+# Snippets   → directory-type storage with 'snippets' content enabled
+#              (used for cicustom user-data to install qemu-guest-agent)
 #
-# Proxmox requires the 'images' content type to be explicitly listed in a
-# storage's content config before cloud-init drives can be created there,
-# even for directory-type (dir) storages. We read storage config via
-# pvesh JSON (reliable) rather than awk-parsing pvesm status text columns.
+# pvesh JSON is used for all storage inspection — avoids fragile awk column
+# parsing of pvesm status text output (columns vary, field 5 is a timestamp).
 # =============================================================================
 header "Detecting Storage"
 
@@ -138,12 +137,10 @@ find_dir_storage() {
   storage_json | python3 -c "
 import sys, json
 stores = json.load(sys.stdin)
-# Prefer 'local'
 for s in stores:
     if s.get('storage') == 'local' and s.get('type') == 'dir':
         print('local')
         sys.exit(0)
-# Fall back to first dir-type
 for s in stores:
     if s.get('type') == 'dir':
         print(s.get('storage', ''))
@@ -151,30 +148,29 @@ for s in stores:
 " 2>/dev/null || true
 }
 
-# ensure_images_content STORAGE_NAME
-# Adds 'images' to the storage's content list if not already present.
-ensure_images_content() {
-  local storage=$1
+# ensure_content_type STORAGE_NAME CONTENT_TYPE
+# Adds CONTENT_TYPE to the storage's content list if not already present.
+ensure_content_type() {
+  local storage=$1 ctype=$2
   local current_content
   current_content=$(get_storage_field "$storage" "content")
 
-  if echo "$current_content" | grep -q 'images'; then
-    info "Storage '${storage}' already has images content type"
+  if echo "$current_content" | grep -qw "$ctype"; then
+    info "Storage '${storage}' already has '${ctype}' content type"
     return 0
   fi
 
-  info "Enabling images content type on storage '${storage}'..."
+  info "Enabling '${ctype}' content type on storage '${storage}'..."
   local new_content
   if [[ -n "$current_content" ]]; then
-    new_content="${current_content},images"
+    new_content="${current_content},${ctype}"
   else
-    # Safe default for a standard Proxmox 'local' dir storage
-    new_content="iso,vztmpl,backup,images"
+    new_content="iso,vztmpl,backup,images,snippets"
   fi
 
   pvesm set "$storage" --content "$new_content" \
-    || die "Failed to enable images content on storage '${storage}'"
-  ok "images content type enabled on '${storage}'"
+    || die "Failed to enable '${ctype}' content on storage '${storage}'"
+  ok "'${ctype}' content type enabled on '${storage}'"
 }
 
 DISK_STORAGE=""
@@ -185,7 +181,6 @@ if pvesm status --storage "local-lvm" &>/dev/null 2>&1; then
   DISK_STORAGE="local-lvm"
   info "OS disk storage: local-lvm"
 else
-  # Fall back to first storage with 'images' in its content list (via JSON)
   DISK_STORAGE=$(storage_json | python3 -c "
 import sys, json
 for s in json.load(sys.stdin):
@@ -197,11 +192,20 @@ for s in json.load(sys.stdin):
   info "OS disk storage: ${DISK_STORAGE} (local-lvm not found)"
 fi
 
-# Cloud-init drive: directory-type storage with images content enabled
+# Cloud-init ISO drive and snippets: directory-type storage
 CI_STORAGE=$(find_dir_storage)
 [[ -n "$CI_STORAGE" ]] || die "No directory-type storage found for cloud-init drive."
-ensure_images_content "$CI_STORAGE"
-info "Cloud-init storage: ${CI_STORAGE}"
+ensure_content_type "$CI_STORAGE" "images"
+ensure_content_type "$CI_STORAGE" "snippets"
+info "Cloud-init / snippets storage: ${CI_STORAGE}"
+
+# Snippet directory path for this storage (always /var/lib/vz/snippets for 'local')
+SNIPPET_DIR=$(pvesm path "${CI_STORAGE}:snippets" 2>/dev/null \
+  | xargs dirname 2>/dev/null || echo "/var/lib/vz/snippets")
+# pvesm path gives the full file path; we want the directory
+# For 'local' this is always /var/lib/vz/snippets
+SNIPPET_DIR="/var/lib/vz/snippets"
+mkdir -p "$SNIPPET_DIR"
 
 # =============================================================================
 # Temporary deploy keypair
@@ -217,6 +221,8 @@ ok "Temporary deploy keypair generated (deleted on exit)"
 cleanup() {
   rm -rf "$DEPLOY_KEY_DIR"
   rm -f /tmp/ridestatus-sshkeys-*.txt 2>/dev/null || true
+  # Snippet files are also cleaned up — they're only needed at first boot
+  rm -f "${SNIPPET_DIR}/ridestatus-userdata-"*.yaml 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -669,6 +675,34 @@ ensure_ubuntu_image() {
 }
 
 # =============================================================================
+# Helper: write cloud-init user-data snippet for a VM
+#
+# The native qm cloud-init params (--ciuser/--sshkeys/--ipconfig) handle user
+# and network setup but do NOT install packages. We use a cicustom user-data
+# snippet to install qemu-guest-agent on first boot so the guest agent is
+# available for deploy.sh to poll after the VM starts.
+#
+# The snippet is a minimal cloud-config written to the Proxmox snippets dir
+# and referenced via --cicustom "user=<storage>:snippets/<file>".
+# It is deleted on script exit (cleanup trap).
+# =============================================================================
+write_userdata_snippet() {
+  local vmid=$1
+  local snippet_file="${SNIPPET_DIR}/ridestatus-userdata-${vmid}.yaml"
+
+  cat > "$snippet_file" <<'YAML'
+#cloud-config
+packages:
+  - qemu-guest-agent
+runcmd:
+  - systemctl enable qemu-guest-agent
+  - systemctl start qemu-guest-agent
+YAML
+
+  echo "$snippet_file"
+}
+
+# =============================================================================
 # Helper: create and configure a VM
 #
 # NOTE: All counter increments use x=$(( x+1 )) rather than (( x++ )) because
@@ -739,13 +773,19 @@ create_vm() {
   qm set "$vmid" --nameserver "${cv_dns[0]:-8.8.8.8}"
   qm set "$vmid" --ciupgrade 0
 
+  # Write user-data snippet to install qemu-guest-agent on first boot
+  local snippet_file
+  snippet_file=$(write_userdata_snippet "$vmid")
+  qm set "$vmid" --cicustom "user=${CI_STORAGE}:snippets/$(basename "$snippet_file")"
+  info "Cloud-init user-data snippet: $(basename "$snippet_file")"
+
   ok "VM ${vmid} configured"
 }
 
 # =============================================================================
 # Helper: wait for guest agent
-# Ubuntu 24.04 first boot installs packages via cloud-init which can take
-# 10+ minutes. Use a 15-minute (900s) timeout to accommodate slow mirrors.
+# Ubuntu 24.04 first boot installs packages (including qemu-guest-agent) via
+# cloud-init which can take 10+ minutes. 15-minute (900s) timeout.
 # =============================================================================
 wait_for_guest_agent() {
   local vmid=$1 max_wait=${2:-900} elapsed=0
@@ -754,7 +794,6 @@ wait_for_guest_agent() {
     qm guest cmd "$vmid" ping &>/dev/null 2>&1 && { ok "Guest agent ready on VM ${vmid}"; return 0; }
     sleep 10
     elapsed=$(( elapsed + 10 ))
-    # Print a dot every 10s and a timestamp every 60s so the operator knows it's alive
     if (( elapsed % 60 == 0 )); then
       echo " ${elapsed}s"
     else
