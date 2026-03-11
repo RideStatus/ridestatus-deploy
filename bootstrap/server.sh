@@ -1,1 +1,1 @@
-PLACEHOLDER_SERVER
+placeholder_server_content
