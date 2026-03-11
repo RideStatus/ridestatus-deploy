@@ -14,7 +14,7 @@
 #   5.  Acquires the Ansible public key:
 #         a) Curls ANSIBLE_KEY_URL if set by deploy.sh (same-host mode) -- no
 #            quoting issues, server.sh fetches directly from the key server
-#         b) Prompts for key server URL if not set (cross-host mode)
+#         b) Prompts for key server URL if not set (cross-host mode or retry)
 #         c) Allows manual paste as fallback
 #   6.  Stores the Ansible public key and adds it to authorized_keys
 #   7.  Interactively collects park config and writes /home/ridestatus/.env
@@ -120,6 +120,139 @@ resolve_nic_hint() {
     fi
   fi
   echo "$default"
+}
+
+# =============================================================================
+# NIC picker -- shows interfaces with their current IP (if any), lets the
+# tech pick by number or type a name directly. Returns the interface name.
+# Usage: pick_nic <result_varname> <prompt_label> <default_iface>
+# =============================================================================
+pick_nic() {
+  local -n _nic_result=$1
+  local label=$2 default=$3
+
+  # Build list of non-loopback, non-virtual interfaces
+  local -a ifaces=()
+  while IFS= read -r iface; do
+    ifaces+=("$iface")
+  done < <(
+    ip -o link show \
+      | awk -F': ' '{print $2}' \
+      | grep -v '^lo$' \
+      | grep -Ev '^(veth|tap|br-|docker|vmbr|dummy)' \
+      | sort
+  )
+
+  echo ""
+  echo -e "${BOLD}${label}${RESET}"
+  echo "  Available interfaces:"
+
+  local default_idx=0
+  for i in "${!ifaces[@]}"; do
+    local iface="${ifaces[$i]}"
+    local ip_info
+    ip_info=$(ip -4 addr show dev "$iface" 2>/dev/null \
+      | awk '/inet /{print $2}' | head -1 || true)
+    local ip_str=""
+    [[ -n "$ip_info" ]] && ip_str="  (${ip_info})"
+    local marker="   "
+    [[ "$iface" == "$default" ]] && marker=" * " && default_idx=$(( i + 1 ))
+    printf "    %s%d) %s%s\n" "$marker" "$(( i + 1 ))" "$iface" "$ip_str"
+  done
+  echo "    (or type an interface name directly)"
+  echo ""
+
+  local def_label="$default"
+  [[ $default_idx -gt 0 ]] && def_label="${default_idx}"
+
+  while true; do
+    read -rp "$(echo -e "${BOLD}Choice${RESET} [${def_label}]: ")" _nic_result </dev/tty
+    _nic_result="${_nic_result:-$default}"
+
+    # If they entered a number, resolve it
+    if [[ "$_nic_result" =~ ^[0-9]+$ ]]; then
+      local n=$(( _nic_result - 1 ))
+      if (( n >= 0 && n < ${#ifaces[@]} )); then
+        _nic_result="${ifaces[$n]}"
+        break
+      else
+        warn "Enter a number between 1 and ${#ifaces[@]}, or type a name."
+        continue
+      fi
+    fi
+
+    # They typed a name (or the default was a name)
+    break
+  done
+}
+
+# =============================================================================
+# Timezone picker -- shows a region menu, then a zone menu within that region.
+# Typing '?' at the timezone prompt triggers the picker.
+# =============================================================================
+pick_timezone() {
+  local -n _tz=$1
+
+  # Group zones by region prefix
+  local -a regions=()
+  while IFS= read -r region; do
+    regions+=("$region")
+  done < <(
+    timedatectl list-timezones 2>/dev/null \
+      | awk -F'/' '{print $1}' | sort -u \
+      | grep -Ev '^(posix|right|Etc)$' || true
+  )
+  # Always add Etc/UTC at end for convenience
+  regions+=("Etc")
+
+  echo ""
+  echo -e "${BOLD}Timezone — select a region:${RESET}"
+  for i in "${!regions[@]}"; do
+    printf "  %2d) %s\n" "$(( i + 1 ))" "${regions[$i]}"
+  done
+  echo ""
+
+  local region_pick region
+  while true; do
+    read -rp "$(echo -e "${BOLD}Region number: ${RESET}")" region_pick </dev/tty
+    if [[ "$region_pick" =~ ^[0-9]+$ ]] \
+        && (( region_pick >= 1 && region_pick <= ${#regions[@]} )); then
+      region="${regions[$(( region_pick - 1 ))]}"
+      break
+    fi
+    warn "Enter a number between 1 and ${#regions[@]}."
+  done
+
+  # List zones in that region
+  local -a zones=()
+  while IFS= read -r z; do
+    zones+=("$z")
+  done < <(
+    timedatectl list-timezones 2>/dev/null \
+      | grep "^${region}/" | sort || true
+  )
+  # Special case: Etc just has UTC
+  if [[ ${#zones[@]} -eq 0 ]]; then
+    zones+=("Etc/UTC")
+  fi
+
+  echo ""
+  echo -e "${BOLD}Timezone — ${region} zones:${RESET}"
+  for i in "${!zones[@]}"; do
+    printf "  %3d) %s\n" "$(( i + 1 ))" "${zones[$i]}"
+  done
+  echo ""
+
+  local zone_pick
+  while true; do
+    read -rp "$(echo -e "${BOLD}Zone number: ${RESET}")" zone_pick </dev/tty
+    if [[ "$zone_pick" =~ ^[0-9]+$ ]] \
+        && (( zone_pick >= 1 && zone_pick <= ${#zones[@]} )); then
+      _tz="${zones[$(( zone_pick - 1 ))]}"
+      break
+    fi
+    warn "Enter a number between 1 and ${#zones[@]}."
+  done
 }
 
 [[ $EUID -eq 0 ]] || die "Must be run as root (sudo bash server.sh)"
@@ -270,13 +403,64 @@ header "Park Configuration"
 
 if [[ -f "$ENV_FILE" ]]; then
   info ".env already exists -- leaving intact (rm ${ENV_FILE} to reconfigure)"
-  source "$ENV_FILE"
+  set -a; source "$ENV_FILE"; set +a
 else
   info "Collecting park configuration -- writes ${ENV_FILE}"
   echo ""
 
-  prompt_required PARK_NAME     "Park name (e.g. Six Flags Great America)"
-  prompt_default  PARK_TIMEZONE "Timezone" "America/Chicago"
+  # --- Park name ---
+  # Offer a numbered list of common Six Flags parks plus a custom option.
+  echo -e "${BOLD}Park name:${RESET}"
+  local_parks=(
+    "Six Flags Great America (Gurnee, IL)"
+    "Six Flags Great Adventure (Jackson, NJ)"
+    "Six Flags Over Georgia (Austell, GA)"
+    "Six Flags Over Texas (Arlington, TX)"
+    "Six Flags St. Louis (Eureka, MO)"
+    "Six Flags New England (Agawam, MA)"
+    "Six Flags Discovery Kingdom (Vallejo, CA)"
+    "Six Flags Fiesta Texas (San Antonio, TX)"
+    "Six Flags America (Bowie, MD)"
+    "Six Flags Mexico (Mexico City, MX)"
+    "Six Flags White Water (Marietta, GA)"
+    "Hurricane Harbor (various)"
+    "Custom (type your own)"
+  )
+  for i in "${!local_parks[@]}"; do
+    printf "  %2d) %s\n" "$(( i + 1 ))" "${local_parks[$i]}"
+  done
+  echo ""
+
+  PARK_NAME=""
+  while [[ -z "$PARK_NAME" ]]; do
+    read -rp "$(echo -e "${BOLD}Choice [13]: ${RESET}")" park_pick </dev/tty
+    park_pick="${park_pick:-13}"
+    if [[ "$park_pick" =~ ^[0-9]+$ ]] && (( park_pick >= 1 && park_pick <= ${#local_parks[@]} - 1 )); then
+      PARK_NAME="${local_parks[$(( park_pick - 1 ))]}"
+      # Strip the location parenthetical: "Six Flags Great America (Gurnee, IL)" -> "Six Flags Great America"
+      PARK_NAME="${PARK_NAME% (*}"
+    elif [[ "$park_pick" == "${#local_parks[@]}" ]]; then
+      prompt_required PARK_NAME "Park name"
+    else
+      warn "Enter a number between 1 and ${#local_parks[@]}."
+    fi
+  done
+
+  # --- Timezone ---
+  echo ""
+  PARK_TIMEZONE_DEFAULT="${PARK_TIMEZONE:-America/Chicago}"
+  echo -e "${BOLD}Timezone${RESET} (enter ? to browse, or type a zone like America/Chicago)"
+  read -rp "$(echo -e "${BOLD}Timezone${RESET} [${PARK_TIMEZONE_DEFAULT}]: ")" PARK_TIMEZONE </dev/tty
+  PARK_TIMEZONE="${PARK_TIMEZONE:-$PARK_TIMEZONE_DEFAULT}"
+  if [[ "$PARK_TIMEZONE" == "?" ]]; then
+    pick_timezone PARK_TIMEZONE
+  fi
+  # Validate
+  if ! timedatectl list-timezones 2>/dev/null | grep -qx "$PARK_TIMEZONE"; then
+    warn "Timezone '${PARK_TIMEZONE}' not recognised -- defaulting to America/Chicago"
+    PARK_TIMEZONE="America/Chicago"
+  fi
+  ok "Timezone: ${PARK_TIMEZONE}"
 
   echo ""
   info "PostgreSQL credentials"
@@ -296,16 +480,22 @@ else
   SERVER_BOOTSTRAP_TOKEN="${SERVER_BOOTSTRAP_TOKEN:0:8}"
 
   echo ""
-  info "NIC interfaces -- shown below for reference:"
-  ip -o link show | awk -F': ' '{print "  "$2}' | grep -v lo
-  echo ""
+  info "NIC interfaces"
+  echo "  (* = pre-selected based on your deploy.sh NIC role assignment)"
 
   # Pre-populate NIC defaults from role hints passed by deploy.sh
   DEPT_NIC_DEFAULT=$(resolve_nic_hint "${RS_DEPT_NIC_HINT:-}" "ens18")
   CORP_NIC_DEFAULT=$(resolve_nic_hint "${RS_CORP_NIC_HINT:-}" "ens19")
 
-  prompt_default DEPT_NIC_INTERFACE     "Department / RideStatus network NIC (chrony, management UI, edge traffic)" "$DEPT_NIC_DEFAULT"
-  prompt_default EXTERNAL_NIC_INTERFACE "Corporate / external NIC (internet, corporate VLAN)"                       "$CORP_NIC_DEFAULT"
+  pick_nic DEPT_NIC_INTERFACE \
+    "Department / RideStatus NIC  (chrony NTP, management UI, edge traffic)" \
+    "$DEPT_NIC_DEFAULT"
+  ok "Dept NIC: ${DEPT_NIC_INTERFACE}"
+
+  pick_nic EXTERNAL_NIC_INTERFACE \
+    "Corporate / external NIC  (internet, corporate VLAN -- may not exist yet)" \
+    "$CORP_NIC_DEFAULT"
+  ok "Corp NIC: ${EXTERNAL_NIC_INTERFACE}"
 
   echo ""
   info "Ansible VM -- the management UI uses this to deploy edge nodes"
@@ -322,14 +512,16 @@ else
   DEPT_NIC_IP_NOW=$(ip -4 addr show dev "${DEPT_NIC_INTERFACE}" 2>/dev/null \
     | awk '/inet /{split($2,a,"/"); print a[1]}' | head -1 || true)
 
+  # Write .env — PARK_NAME and PARK_TIMEZONE are quoted to handle spaces.
+  # All other values are alphanumeric-safe and do not need quoting.
   cat > "$ENV_FILE" << EOF
 # =============================================================================
 # RideStatus Server -- Environment
 # Generated by server.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # =============================================================================
 
-PARK_NAME=${PARK_NAME}
-PARK_TIMEZONE=${PARK_TIMEZONE}
+PARK_NAME="${PARK_NAME}"
+PARK_TIMEZONE="${PARK_TIMEZONE}"
 
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
@@ -379,7 +571,7 @@ EOF
   chmod 600 "$ENV_FILE"
   chown "${RS_USER}:${RS_USER}" "$ENV_FILE"
   ok ".env written to ${ENV_FILE}"
-  source "$ENV_FILE"
+  set -a; source "$ENV_FILE"; set +a
 fi
 
 # =============================================================================
