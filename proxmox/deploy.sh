@@ -37,24 +37,20 @@
 #   When only one VM is on this host, server.sh prompts for the key URL
 #   (which ansible.sh printed) and fetches it itself.
 #
-# NIC roles:
-#   Each vNIC is assigned a role: Department/RideStatus, Corporate, or Other.
-#   The Department NIC carries edge node traffic, the management UI, and NTP.
-#   The Corporate NIC carries internet and corporate VLAN traffic.
-#   "Other" means the NIC is attached to the VM but not pre-selected for any
-#   RideStatus service (use for extra VLANs, storage networks, etc.).
-#   Dept and Corp roles are passed to server.sh as RS_DEPT_NIC_HINT /
-#   RS_CORP_NIC_HINT so it can pre-populate the correct interface names in .env.
-#
-# Connection method selection:
-#   Department NICs always use bridge (shared Proxmox bridge, e.g. vmbr0).
-#   Corporate NICs always use USB NIC passthrough when a free USB NIC is
-#   available — the question is skipped and USB is selected automatically.
-#   This is by design: Cisco port security allows only one approved MAC per
-#   switch port; USB passthrough gives the VM a fixed, exclusive MAC address.
-#   If no free USB NICs are available for a Corporate NIC, the script warns
-#   the tech and falls back to bridge with a note about MAC isolation.
-#   Other NICs always prompt the tech to choose bridge or USB.
+# NIC configuration:
+#   Each vNIC has two properties:
+#     1. Connection type — Bridge (shared Proxmox bridge) or USB NIC passthrough
+#        (exclusive to this VM, preserves the USB adapter's fixed MAC address).
+#        USB passthrough is recommended when the switch port uses Cisco port
+#        security or any other single-MAC enforcement policy.
+#     2. Network label — free text description shown in the summary (e.g.
+#        "Ride Network", "Office Network", "Management VLAN"). Labels are for
+#        the installer's reference only and have no effect on behavior.
+#   One NIC is designated as the default route. That NIC's interface name is
+#   passed to server.sh as RS_DEFAULT_ROUTE_NIC_HINT so it can be pre-populated
+#   in the .env for outbound services (internet updates, SMTP alerts, weather).
+#   RideStatus services listen on all interfaces — there are no network-role
+#   restrictions. Edge nodes can connect from any attached network.
 #
 # Usage: bash proxmox/deploy.sh
 # =============================================================================
@@ -299,7 +295,7 @@ trap cleanup EXIT
 #
 # Pass -t as the first argument to allocate a pseudo-TTY for the remote
 # session. This is required when the remote script uses /dev/tty for
-# interactive prompts (e.g. server.sh Park Configuration). Double -t is used
+# interactive prompts (e.g. server.sh configuration). Double -t is used
 # to force TTY allocation even when deploy.sh itself has no TTY (e.g. when
 # run via bash <(curl ...)).
 #
@@ -495,72 +491,41 @@ declare -A BRIDGE_IFACE_MAP=()
 # =============================================================================
 # NIC configuration helper
 # =============================================================================
-# NIC_ROLE_DEPT_IDX and NIC_ROLE_CORP_IDX track which vNIC index was designated
-# as the Department and Corporate NICs respectively (for passing hints to server.sh)
-NIC_ROLE_DEPT_IDX=-1
-NIC_ROLE_CORP_IDX=-1
+# DEFAULT_ROUTE_NIC_IDX tracks which vNIC index was set as the default route.
+# Passed to server.sh as RS_DEFAULT_ROUTE_NIC_HINT so it can pre-populate
+# the DEFAULT_ROUTE_INTERFACE in .env for outbound services.
+DEFAULT_ROUTE_NIC_IDX=-1
 
 configure_vm_nics() {
   local vm_label=$1
   VM_NICS_TYPE=(); VM_NICS_LABEL=(); VM_NICS_BRIDGE=()
   VM_NICS_USB=();  VM_NICS_MAC=();   VM_NICS_IP=(); VM_NICS_GW=(); VM_NICS_DNS=()
-  VM_NICS_ROLE=()   # "dept", "corp", or "other"
-  NIC_ROLE_DEPT_IDX=-1
-  NIC_ROLE_CORP_IDX=-1
+  VM_NICS_DEFAULT_ROUTE=()   # "yes" or "no"
+  DEFAULT_ROUTE_NIC_IDX=-1
+  local default_route_assigned=false
 
   local nic_num=1
   while true; do
     echo ""
     echo -e "${BOLD}--- ${vm_label}: vNIC${nic_num} ---${RESET}"
 
-    # --- NIC role ---
-    local role_opts=(
-      "Department / RideStatus network  (edge traffic, management UI, NTP)"
-      "Corporate / external network     (internet, corporate VLAN)"
-      "Other / additional NIC           (attached to VM, no service role)"
-    )
-    local role_idx=0
-    # Auto-suggest: first NIC defaults to Department, second to Corporate
-    if   (( nic_num == 1 )); then role_idx=0
-    elif (( nic_num == 2 )); then role_idx=1
-    fi
+    # --- Network label ---
     echo ""
-    echo -e "${BOLD}What role does this NIC play?${RESET}"
-    for i in "${!role_opts[@]}"; do echo "  $((i+1))) ${role_opts[$i]}"; done
-    while true; do
-      read -rp "Choice [$(( role_idx + 1 ))]: " role_pick
-      role_pick="${role_pick:-$(( role_idx + 1 ))}"
-      if [[ "$role_pick" =~ ^[0-9]+$ ]] && (( role_pick >= 1 && role_pick <= 3 )); then
-        role_idx=$(( role_pick - 1 )); break
-      fi
-      warn "Enter 1, 2, or 3."
-    done
-    local nic_role="other"
     local net_label
-    case $role_idx in
-      0) nic_role="dept"; net_label="Department" ;;
-      1) nic_role="corp"; net_label="Corporate" ;;
-      2) nic_role="other"
-         prompt_default net_label "Network label for vNIC${nic_num} (shown in summary)" "Other"
-         ;;
-    esac
-    [[ "$nic_role" == "dept" ]] && NIC_ROLE_DEPT_IDX=$(( nic_num - 1 ))
-    [[ "$nic_role" == "corp" ]] && NIC_ROLE_CORP_IDX=$(( nic_num - 1 ))
+    prompt_required net_label "Network label for vNIC${nic_num} (e.g. Ride Network, Office Network, Management)"
 
-    # --- Connection method ---
-    #
-    # Department NICs: always bridge — they share the Proxmox bridge (vmbr0)
-    # which connects to the onboard NIC on the dept/RideStatus network.
-    #
-    # Corporate NICs: always USB NIC passthrough when a free USB NIC is
-    # available. The question is skipped — USB is selected automatically.
-    # Reason: Cisco port security allows one approved MAC per switch port.
-    # USB passthrough gives the VM the USB adapter's fixed, exclusive MAC.
-    # Bridging would expose multiple VM MACs on the same port and trigger
-    # a port security violation. If no free USB NICs are available, the
-    # script warns the tech and falls back to bridge.
-    #
-    # Other NICs: tech chooses bridge or USB.
+    # --- Connection type ---
+    echo ""
+    echo -e "${BOLD}Connection type for vNIC${nic_num}:${RESET}"
+    echo "  Bridge    — VM connects via a shared Proxmox bridge to a physical NIC."
+    echo "              Multiple VMs share the same bridge. The VM gets a"
+    echo "              Proxmox-generated MAC address."
+    echo ""
+    echo "  USB NIC   — A USB network adapter is passed directly to this VM."
+    echo "  passthrough The VM owns it exclusively and uses the adapter's real,"
+    echo "              fixed MAC address. Recommended when the switch port"
+    echo "              enforces a single approved MAC (e.g. Cisco port security)."
+    echo ""
 
     local available_usb=()
     for u in "${FREE_USB_NICS[@]:-}"; do
@@ -571,46 +536,23 @@ configure_vm_nics() {
       $already || available_usb+=("$u")
     done
 
-    local nic_type="" bridge_name="" usb_iface="" nic_mac="" ip_cidr="" gw="" dns=""
+    local nic_type="" bridge_name="" usb_iface="" nic_mac=""
 
-    if [[ "$nic_role" == "dept" ]]; then
-      # Department NIC — always bridge, no question needed
-      nic_type="bridge"
-      echo ""
-      info "Department NIC — will connect via bridge to the RideStatus/dept network."
-
-    elif [[ "$nic_role" == "corp" ]]; then
-      # Corporate NIC — auto-select USB passthrough if available
-      if [[ ${#available_usb[@]} -gt 0 ]]; then
-        nic_type="usb"
-        echo ""
-        info "Corporate NIC — automatically using USB NIC passthrough."
-        info "  USB passthrough gives this VM an exclusive, fixed MAC address,"
-        info "  which is required for Cisco port security on the corporate switch port."
-      else
-        # No free USB NICs — warn and fall back to bridge
+    if [[ ${#available_usb[@]} -gt 0 ]]; then
+      local conn_opts=("Bridge" "USB NIC passthrough")
+      local conn_idx=0
+      pick_menu conn_idx "Connection type:" "${conn_opts[@]}"
+      if [[ $conn_idx -eq 0 ]]; then
         nic_type="bridge"
-        echo ""
-        warn "Corporate NIC — no free USB NICs available for passthrough."
-        warn "  Falling back to bridge. Note: if this switch port uses Cisco port"
-        warn "  security, you may need to approve the VM's MAC address separately."
+      else
+        nic_type="usb"
       fi
-
     else
-      # Other NIC — let the tech choose
-      local method_opts=("Bridge to onboard NIC (shared, no MAC isolation)")
-      [[ ${#available_usb[@]} -gt 0 ]] && \
-        method_opts+=("USB NIC passthrough (exclusive, stable MAC)")
-      local method_idx=0
-      pick_menu method_idx "How should vNIC${nic_num} connect?" "${method_opts[@]}"
-      if [[ $method_idx -eq 0 ]]; then
-        nic_type="bridge"
-      else
-        nic_type="usb"
-      fi
+      nic_type="bridge"
+      info "No free USB NICs available — using bridge."
     fi
 
-    # --- Bridge selection (dept, corp fallback, or other-bridge) ---
+    # --- Bridge selection ---
     if [[ "$nic_type" == "bridge" ]]; then
       local bridge_opts=()
       for b in "${EXISTING_BRIDGES[@]:-}"; do bridge_opts+=("$b (existing)"); done
@@ -661,11 +603,25 @@ configure_vm_nics() {
       ok "Reserved ${usb_iface}  MAC=${nic_mac}  bus=${USB_NIC_BUS_PATH[$usb_iface]:-unknown}  for ${vm_label} vNIC${nic_num}"
     fi
 
+    # --- IP / gateway / DNS ---
+    local ip_cidr="" gw="" dns=""
     prompt_ip_cidr ip_cidr "${net_label}"
 
-    gw=""
-    if confirm "Is this the default-route NIC for ${vm_label}?"; then
-      prompt_required gw "Default gateway"
+    local is_default_route="no"
+    if ! $default_route_assigned; then
+      echo ""
+      echo -e "${BOLD}Default route / internet NIC?${RESET}"
+      echo "  One NIC should carry internet traffic — software updates, outbound"
+      echo "  alerts, and weather data go out through this interface."
+      echo "  Edge nodes can connect to the server from any network."
+      if confirm "Use vNIC${nic_num} (${net_label}) as the default route for ${vm_label}?"; then
+        is_default_route="yes"
+        default_route_assigned=true
+        DEFAULT_ROUTE_NIC_IDX=$(( nic_num - 1 ))
+        prompt_required gw "Default gateway"
+      fi
+    else
+      info "Default route already assigned to an earlier NIC — skipping for vNIC${nic_num}."
     fi
     prompt_default dns "DNS server" "8.8.8.8"
 
@@ -673,11 +629,16 @@ configure_vm_nics() {
     VM_NICS_BRIDGE+=("$bridge_name"); VM_NICS_USB+=("$usb_iface")
     VM_NICS_MAC+=("$nic_mac")
     VM_NICS_IP+=("$ip_cidr"); VM_NICS_GW+=("$gw"); VM_NICS_DNS+=("$dns")
-    VM_NICS_ROLE+=("$nic_role")
+    VM_NICS_DEFAULT_ROUTE+=("$is_default_route")
 
     nic_num=$(( nic_num + 1 ))
     confirm "Add another NIC to ${vm_label}?" || break
   done
+
+  if ! $default_route_assigned; then
+    warn "No default route NIC was designated for ${vm_label}."
+    warn "The VM will have no internet access until a default route is configured manually."
+  fi
 }
 
 # =============================================================================
@@ -691,7 +652,7 @@ if $CREATE_ANSIBLE; then
   ANSIBLE_NICS_MAC=("${VM_NICS_MAC[@]}")
   ANSIBLE_NICS_IP=("${VM_NICS_IP[@]}");         ANSIBLE_NICS_GW=("${VM_NICS_GW[@]}")
   ANSIBLE_NICS_DNS=("${VM_NICS_DNS[@]}")
-  ANSIBLE_NICS_ROLE=("${VM_NICS_ROLE[@]}")
+  ANSIBLE_NICS_DEFAULT_ROUTE=("${VM_NICS_DEFAULT_ROUTE[@]}")
 fi
 
 if $CREATE_SERVER; then
@@ -702,9 +663,8 @@ if $CREATE_SERVER; then
   SERVER_NICS_MAC=("${VM_NICS_MAC[@]}")
   SERVER_NICS_IP=("${VM_NICS_IP[@]}");         SERVER_NICS_GW=("${VM_NICS_GW[@]}")
   SERVER_NICS_DNS=("${VM_NICS_DNS[@]}")
-  SERVER_NICS_ROLE=("${VM_NICS_ROLE[@]}")
-  SERVER_DEPT_NIC_IDX=$NIC_ROLE_DEPT_IDX
-  SERVER_CORP_NIC_IDX=$NIC_ROLE_CORP_IDX
+  SERVER_NICS_DEFAULT_ROUTE=("${VM_NICS_DEFAULT_ROUTE[@]}")
+  SERVER_DEFAULT_ROUTE_NIC_IDX=$DEFAULT_ROUTE_NIC_IDX
 fi
 
 # =============================================================================
@@ -786,7 +746,7 @@ header "Summary — Review Before Proceeding"
 
 print_vm_summary() {
   local label=$1 vmid=$2 hostname=$3 ram=$4 cores=$5 disk=$6
-  local -n _nt=$7 _nl=$8 _nb=$9 _nu=${10} _nm=${11} _ni=${12} _ng=${13} _nr=${14}
+  local -n _nt=$7 _nl=$8 _nb=$9 _nu=${10} _nm=${11} _ni=${12} _ng=${13} _nd=${14}
   echo -e "  ${BOLD}${label}${RESET}"
   echo "    VM ID: ${vmid}  Hostname: ${hostname}  RAM: ${ram}GB  Cores: ${cores}  Disk: ${disk}GB"
   for i in "${!_nt[@]}"; do
@@ -798,12 +758,8 @@ print_vm_summary() {
       conn="USB passthrough=${_nu[$i]}  MAC=${_nm[$i]}  bus=${bp}"
     fi
     local gw_str=""; [[ -n "${_ng[$i]:-}" ]] && gw_str="  GW=${_ng[$i]}"
-    local role_str=""
-    case "${_nr[$i]:-other}" in
-      dept)  role_str="  [DEPT/RideStatus NIC]" ;;
-      corp)  role_str="  [Corporate NIC]" ;;
-    esac
-    echo "    vNIC$((i+1)): ${_nl[$i]}  IP=${_ni[$i]}${gw_str}  [${conn}]${role_str}"
+    local dr_str=""; [[ "${_nd[$i]:-}" == "yes" ]] && dr_str="  [DEFAULT ROUTE]"
+    echo "    vNIC$((i+1)): ${_nl[$i]}  IP=${_ni[$i]}${gw_str}  [${conn}]${dr_str}"
   done
 }
 
@@ -811,12 +767,12 @@ echo ""
 $CREATE_ANSIBLE && print_vm_summary "Ansible Controller" "$ANSIBLE_VMID" "$ANSIBLE_HOST" \
   "$ANSIBLE_RAM" "$ANSIBLE_CORES" "$ANSIBLE_DISK" \
   ANSIBLE_NICS_TYPE ANSIBLE_NICS_LABEL ANSIBLE_NICS_BRIDGE \
-  ANSIBLE_NICS_USB  ANSIBLE_NICS_MAC   ANSIBLE_NICS_IP ANSIBLE_NICS_GW ANSIBLE_NICS_ROLE
+  ANSIBLE_NICS_USB  ANSIBLE_NICS_MAC   ANSIBLE_NICS_IP ANSIBLE_NICS_GW ANSIBLE_NICS_DEFAULT_ROUTE
 echo ""
 $CREATE_SERVER  && print_vm_summary "RideStatus Server" "$SERVER_VMID" "$SERVER_HOST" \
   "$SERVER_RAM" "$SERVER_CORES" "$SERVER_DISK" \
   SERVER_NICS_TYPE SERVER_NICS_LABEL SERVER_NICS_BRIDGE \
-  SERVER_NICS_USB  SERVER_NICS_MAC   SERVER_NICS_IP SERVER_NICS_GW SERVER_NICS_ROLE
+  SERVER_NICS_USB  SERVER_NICS_MAC   SERVER_NICS_IP SERVER_NICS_GW SERVER_NICS_DEFAULT_ROUTE
 
 echo ""
 info "Storage: OS disk → ${DISK_STORAGE}  |  Cloud-init → ${CI_STORAGE}"
@@ -1071,10 +1027,9 @@ run_bootstrap() {
   local env_prefix=""
   [[ -n "$extra_env" ]] && env_prefix="export ${extra_env} && "
   # -t allocates a pseudo-TTY so server.sh can use /dev/tty for interactive
-  # prompts (Park Configuration). Double -t inside deploy_ssh forces TTY
-  # allocation even when deploy.sh has no TTY (bash <(curl ...)).
-  # Cache-bust the URL with a timestamp so GitHub CDN always serves the latest
-  # version of the bootstrap script.
+  # prompts. Double -t forces TTY allocation even when deploy.sh has no TTY
+  # (bash <(curl ...)). Cache-bust the URL with a timestamp so GitHub CDN
+  # always serves the latest version of the bootstrap script.
   deploy_ssh -t "$ip" \
     "${env_prefix}curl -fsSL -H 'Cache-Control: no-cache' '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) | sudo -E bash" || {
     echo ""
@@ -1147,11 +1102,8 @@ if $CREATE_SERVER; then
     info "server.sh will ask for the Ansible key server URL when it runs."
   fi
 
-  if (( SERVER_DEPT_NIC_IDX >= 0 )); then
-    SERVER_BOOTSTRAP_ENV+=" RS_DEPT_NIC_HINT=net${SERVER_DEPT_NIC_IDX}"
-  fi
-  if (( SERVER_CORP_NIC_IDX >= 0 )); then
-    SERVER_BOOTSTRAP_ENV+=" RS_CORP_NIC_HINT=net${SERVER_CORP_NIC_IDX}"
+  if (( SERVER_DEFAULT_ROUTE_NIC_IDX >= 0 )); then
+    SERVER_BOOTSTRAP_ENV+=" RS_DEFAULT_ROUTE_NIC_HINT=net${SERVER_DEFAULT_ROUTE_NIC_IDX}"
   fi
 
   run_bootstrap "$SERVER_IP" "server.sh" "$SERVER_BOOTSTRAP_ENV" || true
