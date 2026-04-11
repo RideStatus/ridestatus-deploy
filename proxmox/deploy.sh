@@ -30,12 +30,16 @@
 #   After each VM boots, the QEMU guest agent is queried for real NIC names.
 #   Any USB passthrough NIC netplan placeholders are patched in-place.
 #
-# Ansible public key handoff:
-#   When BOTH VMs are on this host, deploy.sh passes ANSIBLE_KEY_URL to
-#   server.sh pointing to ansible.sh's one-shot key server. server.sh fetches
-#   the key directly — no shell quoting issues with multi-layer escaping.
-#   When only one VM is on this host, server.sh prompts for the key URL
-#   (which ansible.sh printed) and fetches it itself.
+# Bootstrap execution order:
+#   1. Both VMs are created and started simultaneously.
+#   2. ansible.sh runs to completion (foreground, with TTY for interactive
+#      prompts). ansible.sh ends by starting its key server and blocking.
+#      NOTE: When both VMs are on the same host, ansible.sh blocks waiting
+#      for server.sh to fetch the key, so server.sh runs in a background
+#      subshell. When only the Ansible VM is on this host, ansible.sh runs
+#      fully in the foreground.
+#   3. server.sh runs after ansible.sh has started its key server (single-
+#      host) or is prompted for the URL manually (two-host).
 #
 # NIC configuration:
 #   Each vNIC has two properties:
@@ -303,9 +307,8 @@ trap cleanup EXIT
 #
 # Pass -t as the first argument to allocate a pseudo-TTY for the remote
 # session. This is required when the remote script uses /dev/tty for
-# interactive prompts (e.g. server.sh configuration). Double -t is used
-# to force TTY allocation even when deploy.sh itself has no TTY (e.g. when
-# run via bash <(curl ...)).
+# interactive prompts. Double -t forces TTY allocation even when deploy.sh
+# itself has no TTY (e.g. when run via bash <(curl ...)).
 #
 # BatchMode is disabled in TTY mode so interactive prompts can function.
 deploy_ssh() {
@@ -1029,7 +1032,9 @@ wait_for_ssh() {
 }
 
 # =============================================================================
-# Helper: run bootstrap script in a VM
+# Helper: run bootstrap script in a VM via TTY SSH
+# All bootstrap scripts use /dev/tty for interactive prompts, so they must
+# always be invoked with deploy_ssh -t (TTY allocation).
 # =============================================================================
 BOOTSTRAP_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap"
 ANSIBLE_KEY_SERVER_PORT=9876
@@ -1039,10 +1044,6 @@ run_bootstrap() {
   info "Running ${script} on ${ip}..."
   local env_prefix=""
   [[ -n "$extra_env" ]] && env_prefix="export ${extra_env} && "
-  # -t allocates a pseudo-TTY so server.sh can use /dev/tty for interactive
-  # prompts. Double -t forces TTY allocation even when deploy.sh has no TTY
-  # (bash <(curl ...)). Cache-bust the URL with a timestamp so GitHub CDN
-  # always serves the latest version of the bootstrap script.
   deploy_ssh -t "$ip" \
     "${env_prefix}curl -fsSL -H 'Cache-Control: no-cache' '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) | sudo -E bash" || {
     echo ""
@@ -1083,17 +1084,21 @@ if $CREATE_SERVER; then
   ok "VM ${SERVER_VMID} started"
 fi
 
+# Boot both VMs simultaneously, then bootstrap sequentially with full TTY.
+# ansible.sh must run first — it starts the key server that server.sh fetches.
+# On single-host (both VMs here): ansible.sh blocks waiting for server.sh to
+#   fetch the key, so we run server.sh in a background subshell, then wait for
+#   ansible.sh to complete.
+# On single-VM runs (Ansible only or Server only): straightforward sequential.
+
+ANSIBLE_IP=""
+SERVER_IP=""
+
 if $CREATE_ANSIBLE; then
   wait_for_guest_agent "$ANSIBLE_VMID"
   fix_usb_nic_names "$ANSIBLE_VMID" ANSIBLE_NICS_TYPE ANSIBLE_NICS_USB ANSIBLE_NICS_IP
   ANSIBLE_IP=$(first_ip ANSIBLE_NICS_IP)
   wait_for_ssh "$ANSIBLE_IP"
-  info "Running ansible.sh on ${ANSIBLE_IP} (key server will stay up for server.sh)..."
-  deploy_ssh "$ANSIBLE_IP" \
-    "curl -fsSL -H 'Cache-Control: no-cache' '${BOOTSTRAP_BASE_URL}/ansible.sh?'\$(date +%s) | sudo bash" &
-  ANSIBLE_BOOTSTRAP_PID=$!
-  info "Waiting for Ansible key server to start (30s)..."
-  sleep 30
 fi
 
 if $CREATE_SERVER; then
@@ -1101,31 +1106,37 @@ if $CREATE_SERVER; then
   fix_usb_nic_names "$SERVER_VMID" SERVER_NICS_TYPE SERVER_NICS_USB SERVER_NICS_IP
   SERVER_IP=$(first_ip SERVER_NICS_IP)
   wait_for_ssh "$SERVER_IP"
+fi
 
-  SERVER_BOOTSTRAP_ENV=""
-
-  if $CREATE_ANSIBLE; then
-    ANSIBLE_IP=$(first_ip ANSIBLE_NICS_IP)
-    ANSIBLE_KEY_URL="http://${ANSIBLE_IP}:${ANSIBLE_KEY_SERVER_PORT}/ansible_ridestatus.pub"
-    ok "Will pass Ansible key URL to server.sh: ${ANSIBLE_KEY_URL}"
-    SERVER_BOOTSTRAP_ENV="ANSIBLE_KEY_URL=${ANSIBLE_KEY_URL}"
-    SERVER_BOOTSTRAP_ENV+=" ANSIBLE_VM_HOST=${ANSIBLE_IP}"
-  else
-    info "Ansible VM is on a separate host."
-    info "server.sh will ask for the Ansible key server URL when it runs."
-  fi
-
+if $CREATE_ANSIBLE && $CREATE_SERVER; then
+  # Both VMs on this host — run server.sh in background (waits for key),
+  # then run ansible.sh in foreground (blocks until key is fetched).
+  ANSIBLE_KEY_URL="http://${ANSIBLE_IP}:${ANSIBLE_KEY_SERVER_PORT}/ansible_ridestatus.pub"
+  SERVER_BOOTSTRAP_ENV="ANSIBLE_KEY_URL=${ANSIBLE_KEY_URL} ANSIBLE_VM_HOST=${ANSIBLE_IP}"
   if (( SERVER_DEFAULT_ROUTE_NIC_IDX >= 0 )); then
     SERVER_BOOTSTRAP_ENV+=" RS_DEFAULT_ROUTE_NIC_HINT=net${SERVER_DEFAULT_ROUTE_NIC_IDX}"
   fi
 
-  run_bootstrap "$SERVER_IP" "server.sh" "$SERVER_BOOTSTRAP_ENV" || true
-fi
+  info "Starting server.sh in background (waiting for Ansible key)..."
+  ( run_bootstrap "$SERVER_IP" "server.sh" "$SERVER_BOOTSTRAP_ENV" || true ) &
+  SERVER_BOOTSTRAP_PID=$!
 
-if $CREATE_ANSIBLE && [[ -n "${ANSIBLE_BOOTSTRAP_PID:-}" ]]; then
-  info "Waiting for ansible.sh to complete..."
-  wait "$ANSIBLE_BOOTSTRAP_PID" 2>/dev/null && ok "ansible.sh complete" \
-    || warn "ansible.sh may have encountered errors — check logs on ${ANSIBLE_IP}"
+  run_bootstrap "$ANSIBLE_IP" "ansible.sh" || true
+
+  info "Waiting for server.sh to complete..."
+  wait "$SERVER_BOOTSTRAP_PID" 2>/dev/null || true
+
+elif $CREATE_ANSIBLE; then
+  # Ansible only on this host — run ansible.sh in foreground
+  run_bootstrap "$ANSIBLE_IP" "ansible.sh" || true
+
+elif $CREATE_SERVER; then
+  # Server only on this host — server.sh will prompt for Ansible key URL
+  SERVER_BOOTSTRAP_ENV=""
+  if (( SERVER_DEFAULT_ROUTE_NIC_IDX >= 0 )); then
+    SERVER_BOOTSTRAP_ENV="RS_DEFAULT_ROUTE_NIC_HINT=net${SERVER_DEFAULT_ROUTE_NIC_IDX}"
+  fi
+  run_bootstrap "$SERVER_IP" "server.sh" "$SERVER_BOOTSTRAP_ENV" || true
 fi
 
 # =============================================================================
@@ -1133,8 +1144,8 @@ fi
 # =============================================================================
 header "Deployment Complete"
 
-$CREATE_ANSIBLE && ok "Ansible Controller VM ${ANSIBLE_VMID} (${ANSIBLE_HOST}) — $(first_ip ANSIBLE_NICS_IP)"
-$CREATE_SERVER  && ok "RideStatus Server VM ${SERVER_VMID}  (${SERVER_HOST})  — $(first_ip SERVER_NICS_IP)"
+$CREATE_ANSIBLE && ok "Ansible Controller VM ${ANSIBLE_VMID} (${ANSIBLE_HOST}) — ${ANSIBLE_IP}"
+$CREATE_SERVER  && ok "RideStatus Server VM ${SERVER_VMID}  (${SERVER_HOST})  — ${SERVER_IP}"
 
 echo ""
 info "Next steps:"
