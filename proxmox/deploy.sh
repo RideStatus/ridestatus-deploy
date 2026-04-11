@@ -41,6 +41,12 @@
 #   3. server.sh runs after ansible.sh has started its key server (single-
 #      host) or is prompted for the URL manually (two-host).
 #
+# Bootstrap script delivery:
+#   Bootstrap scripts are downloaded to a temp file on the remote VM before
+#   execution. This keeps stdin free for interactive prompts (/dev/tty reads)
+#   and avoids the pipe-to-sudo TTY issue where sudo may reject or misbehave
+#   when its script arrives on stdin, even with NOPASSWD and -t -t SSH flags.
+#
 # NIC configuration:
 #   Each vNIC has two properties:
 #     1. Connection type — Bridge (shared Proxmox bridge) or USB NIC passthrough
@@ -1033,8 +1039,11 @@ wait_for_ssh() {
 
 # =============================================================================
 # Helper: run bootstrap script in a VM via TTY SSH
-# All bootstrap scripts use /dev/tty for interactive prompts, so they must
-# always be invoked with deploy_ssh -t (TTY allocation).
+#
+# Downloads the script to a temp file on the remote VM, then executes it.
+# This keeps stdin free for interactive prompts (/dev/tty reads) and avoids
+# the pipe-to-sudo TTY issue where sudo may reject or misbehave when its
+# script arrives on stdin, even with NOPASSWD and SSH -t -t flags.
 # =============================================================================
 BOOTSTRAP_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap"
 ANSIBLE_KEY_SERVER_PORT=9876
@@ -1042,14 +1051,20 @@ ANSIBLE_KEY_SERVER_PORT=9876
 run_bootstrap() {
   local ip=$1 script=$2 extra_env=${3:-}
   info "Running ${script} on ${ip}..."
-  local env_prefix=""
-  [[ -n "$extra_env" ]] && env_prefix="export ${extra_env} && "
-  deploy_ssh -t "$ip" \
-    "${env_prefix}curl -fsSL -H 'Cache-Control: no-cache' '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) | sudo -E bash" || {
+  local env_export=""
+  [[ -n "$extra_env" ]] && env_export="export ${extra_env}; "
+  deploy_ssh -t "$ip" "
+    set -e
+    _rs_tmp=\$(mktemp /tmp/ridestatus-bootstrap-XXXXXX.sh)
+    curl -fsSL -H 'Cache-Control: no-cache' \
+      '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) -o \"\$_rs_tmp\"
+    ${env_export}sudo -E bash \"\$_rs_tmp\"
+    rm -f \"\$_rs_tmp\"
+  " || {
     echo ""
     err "Bootstrap failed for ${script} on ${ip}."
     err "To retry: ssh ridestatus@${ip}"
-    err "  curl -fsSL -H 'Cache-Control: no-cache' '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) | sudo bash"
+    err "  curl -fsSL -H 'Cache-Control: no-cache' '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) -o /tmp/rs.sh && sudo bash /tmp/rs.sh"
     return 1
   }
   ok "${script} completed on ${ip}"
