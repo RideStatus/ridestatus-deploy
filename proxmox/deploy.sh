@@ -52,6 +52,14 @@
 #   RideStatus services listen on all interfaces — there are no network-role
 #   restrictions. Edge nodes can connect from any attached network.
 #
+# USB bus path detection:
+#   The sysfs path for USB NICs on modern kernels routes through a PCI segment
+#   before the USB hub: e.g.
+#     /sys/devices/pci0000:00/0000:00:08.1/0000:2d:00.3/usb4/4-2/4-2:2.0
+#   The Proxmox passthrough identifier is the port path after the usbN/ segment
+#   (e.g. "4-2"), NOT the segment immediately after /devices/. The regex
+#   `usb\d+/\K[\d]+-[\d.]+(?=/)` extracts this correctly.
+#
 # Usage: bash proxmox/deploy.sh
 # =============================================================================
 
@@ -398,7 +406,12 @@ for iface in "${ALL_IFACES[@]}"; do
   USB_NIC_VENDOR_PRODUCT["$iface"]="$vp"
   USB_NIC_MAC["$iface"]=$(iface_mac "$iface")
 
-  bus_path=$(echo "$syspath" | grep -oP '(?<=/devices/)[\d]+-[\d.]+(?=/)' | head -1 || true)
+  # Extract USB bus path (e.g. "4-2") from the usbN/ segment of the sysfs path.
+  # Sysfs paths route through PCI before USB on modern kernels, so the port path
+  # is NOT immediately after /devices/. Example path:
+  #   /sys/devices/pci0000:00/0000:00:08.1/0000:2d:00.3/usb4/4-2/4-2:2.0
+  # The regex matches "4-2" by looking after the usbN/ component.
+  bus_path=$(echo "$syspath" | grep -oP 'usb\d+/\K[\d]+-[\d.]+(?=/)' | head -1 || true)
   [[ -n "$bus_path" ]] && USB_NIC_BUS_PATH["$iface"]="$bus_path"
 done
 
