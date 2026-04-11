@@ -20,12 +20,15 @@
 #   10. Starts rs-server via PM2 and configures PM2 startup on boot
 #
 # Environment variables (passed by deploy.sh on single-host deployments):
-#   ANSIBLE_KEY_URL         — URL to fetch the Ansible public key from
-#   ANSIBLE_VM_HOST         — IP of the Ansible Controller VM
+#   ANSIBLE_KEY_URL           — URL to fetch the Ansible public key from
+#   ANSIBLE_VM_HOST           — IP of the Ansible Controller VM
 #   RS_DEFAULT_ROUTE_NIC_HINT — vNIC index hint for DEFAULT_ROUTE_INTERFACE
 #
+# Interactive reads use /dev/tty explicitly so the script works when piped
+# from curl (stdin is the pipe, not the terminal).
+#
 # Usage (called by deploy.sh via SSH, or manually):
-#   curl -fsSL https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap/server.sh | sudo bash
+#   curl -fsSL .../bootstrap/server.sh | sudo bash
 # =============================================================================
 
 set -euo pipefail
@@ -38,6 +41,35 @@ ok()     { echo -e "${GREEN}[server.sh]${RESET} $*"; }
 warn()   { echo -e "${YELLOW}[server.sh]${RESET} $*"; }
 die()    { echo -e "${RED}[server.sh] ERROR:${RESET} $*" >&2; exit 1; }
 header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
+
+# All interactive reads go through /dev/tty so they work when stdin is a pipe
+# (e.g. curl ... | sudo bash). prompt_tty VAR "message" [default]
+prompt_tty() {
+  local -n _pt_var=$1; local msg=$2; local def=${3:-}
+  local prompt
+  if [[ -n "$def" ]]; then
+    prompt="$(echo -e "${BOLD}${msg}${RESET} [${def}]: ")"
+  else
+    prompt="$(echo -e "${BOLD}${msg}${RESET}: ")"
+  fi
+  read -rp "$prompt" _pt_var </dev/tty
+  [[ -n "$def" && -z "$_pt_var" ]] && _pt_var="$def"
+}
+
+prompt_tty_secret() {
+  local -n _pts_var=$1; local msg=$2
+  read -rsp "$(echo -e "${BOLD}${msg}${RESET}: ")" _pts_var </dev/tty
+  echo ""
+}
+
+prompt_tty_confirm() {
+  # Returns 0 (yes) or 1 (no)
+  local msg=$1 ans
+  while true; do
+    read -rp "$(echo -e "${BOLD}${msg}${RESET} [y/n]: ")" ans </dev/tty
+    case "$ans" in [Yy]*) return 0 ;; [Nn]*) return 1 ;; *) warn "Please answer y or n." ;; esac
+  done
+}
 
 [[ $EUID -eq 0 ]] || die "Must be run as root (sudo bash server.sh)"
 
@@ -150,22 +182,12 @@ ok "Home directory ready: ${RS_HOME}"
 
 # =============================================================================
 # 4. Ansible public key install
-#
-# The Ansible Controller VM manages edge nodes via SSH using its keypair.
-# The server needs to store the Ansible public key so:
-#   a) ansibleBridge.js can verify the Ansible VM's identity
-#   b) The .env ANSIBLE_PUBKEY_PATH points to it for the management UI
-#
-# Key is fetched from the one-shot HTTP server on the Ansible VM (port 9876).
-# deploy.sh passes ANSIBLE_KEY_URL when both VMs are on the same host.
-# On a two-host deployment (like this one), we prompt for the URL.
 # =============================================================================
 header "Ansible Public Key"
 
 if [[ -f "$ANSIBLE_PUBKEY_PATH" ]]; then
   info "Ansible public key already installed at ${ANSIBLE_PUBKEY_PATH} — skipping fetch"
 else
-  # Determine the key URL
   if [[ -z "$ANSIBLE_KEY_URL" ]]; then
     echo ""
     echo -e "${BOLD}The Ansible Controller VM hosts a one-shot key server.${RESET}"
@@ -173,7 +195,7 @@ else
     echo "  http://10.x.x.x:9876/ansible_ridestatus.pub"
     echo ""
     while true; do
-      read -rp "$(echo -e "${BOLD}Ansible key server URL: ${RESET}")" ANSIBLE_KEY_URL
+      prompt_tty ANSIBLE_KEY_URL "Ansible key server URL"
       [[ -n "$ANSIBLE_KEY_URL" ]] && break
       warn "URL is required."
     done
@@ -202,9 +224,8 @@ header "GitHub Access"
 
 GITHUB_CREDS_CONFIGURED=false
 
-if [[ -f "${GITHUB_KEY}" ]] || sudo -u "$RS_USER" git credential fill <<< "protocol=https
-host=github.com" 2>/dev/null | grep -q 'password='; then
-  info "GitHub credentials already configured — skipping"
+if [[ -f "${GITHUB_KEY}" ]]; then
+  info "GitHub deploy key already present — skipping setup"
   GITHUB_CREDS_CONFIGURED=true
 fi
 
@@ -218,8 +239,7 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
 
   GITHUB_AUTH_METHOD=""
   while true; do
-    read -rp "$(echo -e "${BOLD}Choose [1]: ${RESET}")" GITHUB_AUTH_METHOD
-    GITHUB_AUTH_METHOD=${GITHUB_AUTH_METHOD:-1}
+    prompt_tty GITHUB_AUTH_METHOD "Choose" "1"
     [[ "$GITHUB_AUTH_METHOD" =~ ^[12]$ ]] && break
     warn "Enter 1 or 2."
   done
@@ -246,7 +266,8 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
     echo ""
     echo -e "${BOLD}  Steps: Settings → Deploy keys → Add deploy key → paste → Allow write access: NO${RESET}"
     echo ""
-    read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")"
+    local _enter
+    read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")" _enter </dev/tty
 
     SSH_CONFIG="${RS_HOME}/.ssh/config"
     if ! grep -q "Host github.com" "$SSH_CONFIG" 2>/dev/null; then
@@ -263,7 +284,6 @@ EOF
       chown "${RS_USER}:${RS_USER}" "$SSH_CONFIG"
     fi
 
-    # Switch to SSH URL
     SERVER_REPO="git@github.com:RideStatus/ridestatus-server.git"
 
     info "Testing deploy key access..."
@@ -280,9 +300,8 @@ EOF
     echo "  Token type: Classic"
     echo "  Scopes needed: repo (read-only is sufficient)"
     echo ""
-    read -rp "$(echo -e "${BOLD}GitHub username: ${RESET}")" GITHUB_USER
-    read -rsp "$(echo -e "${BOLD}GitHub PAT (input hidden): ${RESET}")" GITHUB_PAT
-    echo ""
+    prompt_tty GITHUB_USER "GitHub username"
+    prompt_tty_secret GITHUB_PAT "GitHub PAT (input hidden)"
 
     if [[ -n "$GITHUB_USER" && -n "$GITHUB_PAT" ]]; then
       sudo -u "$RS_USER" git config --global credential.helper store
@@ -326,7 +345,6 @@ systemctl start postgresql
 DB_NAME="ridestatus"
 DB_USER="ridestatus"
 
-# Generate a random password if not already set
 if [[ ! -f "${RS_HOME}/.pgpass_ridestatus" ]]; then
   DB_PASS=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32)))")
   echo "$DB_PASS" > "${RS_HOME}/.pgpass_ridestatus"
@@ -337,7 +355,6 @@ else
   info "Using existing PostgreSQL password"
 fi
 
-# Create user and database if they don't exist
 sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" \
   | grep -q 1 || sudo -u postgres psql \
     -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}';"
@@ -346,7 +363,6 @@ sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'"
   | grep -q 1 || sudo -u postgres createdb \
     -O "$DB_USER" "$DB_NAME"
 
-# Ensure password is current (idempotent)
 sudo -u postgres psql -c "ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASS}';" &>/dev/null
 
 ok "PostgreSQL database '${DB_NAME}' and user '${DB_USER}' ready"
@@ -358,17 +374,7 @@ header "Server Configuration"
 
 ENV_FILE="${SERVER_DIR}/.env"
 
-# Determine default interface hint
-DEFAULT_IFACE=""
-if [[ -n "$RS_DEFAULT_ROUTE_NIC_HINT" ]]; then
-  # Map netN hint to actual interface name via guest agent NIC order
-  # net0 = first bridge NIC inside the VM (typically ens18)
-  # We check for the interface that has the default route
-  DEFAULT_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1 || true)
-  info "Default route interface detected: ${DEFAULT_IFACE:-unknown}"
-fi
-[[ -z "$DEFAULT_IFACE" ]] && \
-  DEFAULT_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1 || true)
+DEFAULT_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -1 || true)
 
 if [[ -f "$ENV_FILE" ]]; then
   warn ".env already exists at ${ENV_FILE} — leaving intact"
@@ -379,27 +385,25 @@ else
   echo "  These values are written to .env and can be changed later."
   echo ""
 
-  read -rp "$(echo -e "${BOLD}Park name: ${RESET}")" PARK_NAME
+  prompt_tty PARK_NAME "Park name"
   [[ -z "$PARK_NAME" ]] && PARK_NAME="My Park"
 
   echo ""
   echo "  Common timezones: America/Chicago  America/New_York  America/Los_Angeles"
   echo "                    America/Denver   Europe/London     Australia/Sydney"
-  read -rp "$(echo -e "${BOLD}Timezone [America/Chicago]: ${RESET}")" PARK_TZ
-  PARK_TZ=${PARK_TZ:-America/Chicago}
+  prompt_tty PARK_TZ "Timezone" "America/Chicago"
 
-  # Set system timezone
   timedatectl set-timezone "$PARK_TZ" 2>/dev/null || warn "Could not set system timezone to ${PARK_TZ}"
 
   echo ""
-  read -rp "$(echo -e "${BOLD}API key for edge node authentication (or Enter to generate): ${RESET}")" API_KEY
+  prompt_tty API_KEY "API key for edge node authentication (or Enter to generate)"
   if [[ -z "$API_KEY" ]]; then
     API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
     ok "Generated API key: ${API_KEY}"
   fi
 
   echo ""
-  read -rp "$(echo -e "${BOLD}Bootstrap token for edge node enrollment (max 8 chars, or Enter to generate): ${RESET}")" BOOTSTRAP_TOKEN
+  prompt_tty BOOTSTRAP_TOKEN "Bootstrap token for edge node enrollment (max 8 chars, or Enter to generate)"
   if [[ -z "$BOOTSTRAP_TOKEN" ]]; then
     BOOTSTRAP_TOKEN=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8)))")
     ok "Generated bootstrap token: ${BOOTSTRAP_TOKEN}"
@@ -407,20 +411,17 @@ else
   BOOTSTRAP_TOKEN="${BOOTSTRAP_TOKEN:0:8}"
 
   echo ""
-  read -rp "$(echo -e "${BOLD}WeatherAPI.com API key (or Enter to skip): ${RESET}")" WEATHER_API_KEY
-  read -rp "$(echo -e "${BOLD}Weather ZIP code [00000]: ${RESET}")" WEATHER_ZIP
-  WEATHER_ZIP=${WEATHER_ZIP:-00000}
+  prompt_tty WEATHER_API_KEY "WeatherAPI.com API key (or Enter to skip)"
+  prompt_tty WEATHER_ZIP "Weather ZIP code" "00000"
 
   echo ""
   echo -e "${BOLD}SMTP alert settings (press Enter to skip each):${RESET}"
-  read -rp "  Alert email address: " ALERT_EMAIL
-  read -rp "  Alert SMS address: " ALERT_SMS
-  read -rp "  SMTP host: " SMTP_HOST
-  read -rp "  SMTP port [587]: " SMTP_PORT
-  SMTP_PORT=${SMTP_PORT:-587}
-  read -rp "  SMTP username: " SMTP_USER
-  read -rsp "  SMTP password (hidden): " SMTP_PASS
-  echo ""
+  prompt_tty ALERT_EMAIL "  Alert email address"
+  prompt_tty ALERT_SMS "  Alert SMS address"
+  prompt_tty SMTP_HOST "  SMTP host"
+  prompt_tty SMTP_PORT "  SMTP port" "587"
+  prompt_tty SMTP_USER "  SMTP username"
+  prompt_tty_secret SMTP_PASS "  SMTP password (hidden)"
 
   cat > "$ENV_FILE" << EOF
 # =============================================================================
@@ -493,10 +494,8 @@ ok "npm install complete"
 
 header "Running Database Migrations"
 
-# Set PGPASSWORD so migrate.js can connect without a password prompt
 export PGPASSWORD="$DB_PASS"
 
-# Source .env so migrate.js picks up connection settings
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
@@ -520,13 +519,11 @@ header "Starting RideStatus Server (PM2)"
 mkdir -p "${LOG_DIR}"
 chown "${RS_USER}:${RS_USER}" "${LOG_DIR}"
 
-# Copy ecosystem config to RS_HOME so PM2 can find it on boot
 ECOSYSTEM_SRC="${SERVER_DIR}/ecosystem.config.js"
 ECOSYSTEM_DEST="${RS_HOME}/ecosystem.config.js"
 cp "$ECOSYSTEM_SRC" "$ECOSYSTEM_DEST"
 chown "${RS_USER}:${RS_USER}" "$ECOSYSTEM_DEST"
 
-# Start or restart the server
 if sudo -u "$RS_USER" pm2 describe ridestatus-server &>/dev/null; then
   info "PM2 process already exists — reloading"
   sudo -u "$RS_USER" pm2 reload ridestatus-server --update-env
@@ -536,14 +533,12 @@ fi
 
 sudo -u "$RS_USER" pm2 save
 
-# Configure PM2 to start on boot via systemd
 PM2_STARTUP=$(sudo -u "$RS_USER" pm2 startup systemd -u "$RS_USER" --hp "$RS_HOME" 2>/dev/null \
   | grep 'sudo env' || true)
 if [[ -n "$PM2_STARTUP" ]]; then
   eval "$PM2_STARTUP"
   ok "PM2 startup configured"
 else
-  # pm2 startup already configured or returned the command inline
   pm2 startup systemd -u "$RS_USER" --hp "$RS_HOME" 2>/dev/null || true
   ok "PM2 startup configured"
 fi
