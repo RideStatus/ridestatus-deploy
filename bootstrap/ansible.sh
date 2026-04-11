@@ -20,6 +20,14 @@
 #   9. Starts a one-shot HTTP key server on port 9876 so that server.sh
 #      can fetch the Ansible public key automatically.
 #
+# User switching:
+#   Uses runuser -l ridestatus -c "..." for all commands that must run as the
+#   ridestatus user. This correctly sets HOME, PATH, and environment without
+#   requiring a TTY.
+#
+# Interactive reads:
+#   All prompts use /dev/tty so they work when the script is piped from curl.
+#
 # Usage (called by deploy.sh via SSH, or manually):
 #   curl -fsSL https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap/ansible.sh | sudo bash
 # =============================================================================
@@ -34,6 +42,28 @@ ok()     { echo -e "${GREEN}[ansible.sh]${RESET} $*"; }
 warn()   { echo -e "${YELLOW}[ansible.sh]${RESET} $*"; }
 die()    { echo -e "${RED}[ansible.sh] ERROR:${RESET} $*" >&2; exit 1; }
 header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
+
+# Run a command as the ridestatus user with a proper login environment.
+as_rs() { runuser -l ridestatus -c "$1"; }
+
+# All interactive reads go through /dev/tty so they work when stdin is a pipe.
+prompt_tty() {
+  local -n _pt_var=$1; local msg=$2; local def=${3:-}
+  local prompt
+  if [[ -n "$def" ]]; then
+    prompt="$(echo -e "${BOLD}${msg}${RESET} [${def}]: ")"
+  else
+    prompt="$(echo -e "${BOLD}${msg}${RESET}: ")"
+  fi
+  read -rp "$prompt" _pt_var </dev/tty
+  [[ -n "$def" && -z "$_pt_var" ]] && _pt_var="$def"
+}
+
+prompt_tty_secret() {
+  local -n _pts_var=$1; local msg=$2
+  read -rsp "$(echo -e "${BOLD}${msg}${RESET}: ")" _pts_var </dev/tty
+  echo ""
+}
 
 [[ $EUID -eq 0 ]] || die "Must be run as root (sudo bash ansible.sh)"
 
@@ -125,10 +155,7 @@ if [[ -f "${ANSIBLE_KEY}" ]]; then
   warn "Ansible keypair already exists at ${ANSIBLE_KEY} — leaving intact"
   warn "To rotate: rm ${ANSIBLE_KEY} ${ANSIBLE_KEY}.pub and re-run"
 else
-  sudo -u "$RS_USER" ssh-keygen \
-    -t ed25519 -f "${ANSIBLE_KEY}" -N "" -C "ansible@ridestatus" -q
-  chmod 600 "${ANSIBLE_KEY}"
-  chmod 644 "${ANSIBLE_KEY}.pub"
+  as_rs "ssh-keygen -t ed25519 -f '${ANSIBLE_KEY}' -N '' -C 'ansible@ridestatus' -q"
   ok "Keypair generated: ${ANSIBLE_KEY}"
 fi
 
@@ -148,10 +175,11 @@ header "GitHub Access for Private Repos"
 
 GITHUB_CREDS_CONFIGURED=false
 
-# Check if already configured
-if [[ -f "${GITHUB_KEY}" ]] || sudo -u "$RS_USER" git credential fill <<< "protocol=https
-host=github.com" 2>/dev/null | grep -q 'password='; then
-  info "GitHub credentials already configured — skipping"
+if [[ -f "${GITHUB_KEY}" ]]; then
+  info "GitHub deploy key already present — skipping setup"
+  GITHUB_CREDS_CONFIGURED=true
+elif [[ -f "${RS_HOME}/.git-credentials" ]]; then
+  info "GitHub PAT credentials already present — skipping setup"
   GITHUB_CREDS_CONFIGURED=true
 fi
 
@@ -165,22 +193,15 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
 
   GITHUB_AUTH_METHOD=""
   while true; do
-    read -rp "$(echo -e "${BOLD}Choose [1]: ${RESET}")" GITHUB_AUTH_METHOD
-    GITHUB_AUTH_METHOD=${GITHUB_AUTH_METHOD:-1}
+    prompt_tty GITHUB_AUTH_METHOD "Choose" "1"
     [[ "$GITHUB_AUTH_METHOD" =~ ^[12]$ ]] && break
     warn "Enter 1 or 2."
   done
 
   if [[ "$GITHUB_AUTH_METHOD" == "1" ]]; then
-    # --- Deploy key ---
-    echo ""
-    if [[ -f "${GITHUB_KEY}" ]]; then
-      info "GitHub deploy key already exists at ${GITHUB_KEY}"
-    else
-      sudo -u "$RS_USER" ssh-keygen \
-        -t ed25519 -f "${GITHUB_KEY}" -N "" -C "ridestatus-ansible-deploy" -q
-      chmod 600 "${GITHUB_KEY}"
-      chmod 644 "${GITHUB_KEY}.pub"
+    # Deploy key — generate as ridestatus user so ownership is correct
+    if [[ ! -f "${GITHUB_KEY}" ]]; then
+      as_rs "ssh-keygen -t ed25519 -f '${GITHUB_KEY}' -N '' -C 'ridestatus-ansible-deploy' -q"
       ok "GitHub deploy key generated: ${GITHUB_KEY}"
     fi
 
@@ -199,9 +220,8 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
     echo ""
     echo -e "${BOLD}  Steps: Settings → Deploy keys → Add deploy key → paste key → Allow write access: NO${RESET}"
     echo ""
-
-    # Wait for the tech to add the key before testing
-    read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")"
+    _enter=""
+    read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")" _enter </dev/tty
 
     # Configure SSH to use this key for github.com
     SSH_CONFIG="${RS_HOME}/.ssh/config"
@@ -228,20 +248,12 @@ EOF
     TEST_PASS=true
     for repo in "${PRIVATE_REPOS[@]}"; do
       repo_name=$(basename "$repo" .git)
-      if sudo -u "$RS_USER" ssh -i "${GITHUB_KEY}" \
-          -o StrictHostKeyChecking=no \
-          -o BatchMode=yes \
-          git@github.com 2>&1 | grep -q "successfully authenticated"; then
+      if as_rs "git ls-remote '${repo}' HEAD" &>/dev/null; then
         ok "  ✓ ${repo_name} — access confirmed"
       else
-        # Try git ls-remote as a more reliable test
-        if sudo -u "$RS_USER" git ls-remote "$repo" HEAD &>/dev/null; then
-          ok "  ✓ ${repo_name} — access confirmed"
-        else
-          warn "  ✗ ${repo_name} — could not verify access"
-          warn "    Check that the deploy key was added to: https://github.com/RideStatus/${repo_name}/settings/keys"
-          TEST_PASS=false
-        fi
+        warn "  ✗ ${repo_name} — could not verify access"
+        warn "    Check that the deploy key was added to: https://github.com/RideStatus/${repo_name}/settings/keys"
+        TEST_PASS=false
       fi
     done
 
@@ -253,23 +265,21 @@ EOF
     fi
 
   else
-    # --- Personal access token ---
+    # Personal access token
     echo ""
     echo -e "${BOLD}Create a PAT at: https://github.com/settings/tokens${RESET}"
     echo "  Token type: Classic"
     echo "  Scopes needed: repo (read-only is sufficient)"
     echo ""
-    read -rp "$(echo -e "${BOLD}GitHub username: ${RESET}")" GITHUB_USER
-    read -rsp "$(echo -e "${BOLD}GitHub PAT (input hidden): ${RESET}")" GITHUB_PAT
-    echo ""
+    prompt_tty GITHUB_USER "GitHub username"
+    prompt_tty_secret GITHUB_PAT "GitHub PAT (input hidden)"
 
     if [[ -z "$GITHUB_USER" || -z "$GITHUB_PAT" ]]; then
       warn "Username or PAT was empty — skipping GitHub credential storage"
       warn "Ansible deploys to edge nodes will fail until credentials are configured"
       warn "Re-run ansible.sh to configure credentials"
     else
-      # Store credential using git credential store
-      sudo -u "$RS_USER" git config --global credential.helper store
+      as_rs "git config --global credential.helper store"
       echo "https://${GITHUB_USER}:${GITHUB_PAT}@github.com" \
         > "${RS_HOME}/.git-credentials"
       chmod 600 "${RS_HOME}/.git-credentials"
@@ -280,9 +290,8 @@ EOF
       info "Testing PAT access..."
       TEST_PASS=true
       for repo in "${PRIVATE_REPOS[@]}"; do
-        # Convert SSH URL to HTTPS for PAT auth
         https_url="https://github.com/RideStatus/$(basename "$repo" .git).git"
-        if sudo -u "$RS_USER" git ls-remote "$https_url" HEAD &>/dev/null; then
+        if as_rs "git ls-remote '${https_url}' HEAD" &>/dev/null; then
           ok "  ✓ $(basename "$repo" .git) — access confirmed"
         else
           warn "  ✗ $(basename "$repo" .git) — could not verify — check PAT scopes"
@@ -298,7 +307,6 @@ EOF
       fi
 
       # Update group_vars so Ansible uses HTTPS URLs when PAT is configured
-      # (deploy key uses SSH URLs, already set in group_vars/all.yml)
       GV_ALL="${DEPLOY_DIR}/ansible/group_vars/all.yml"
       if [[ -f "$GV_ALL" ]] && grep -q 'ridestatus_ride_repo:' "$GV_ALL"; then
         sed -i "s|ridestatus_ride_repo:.*|ridestatus_ride_repo: https://github.com/RideStatus/ridestatus-ride.git|" "$GV_ALL"
@@ -315,9 +323,9 @@ header "Cloning ridestatus-deploy"
 
 if [[ -d "${DEPLOY_DIR}/.git" ]]; then
   info "Repo already cloned — pulling latest"
-  sudo -u "$RS_USER" git -C "$DEPLOY_DIR" pull --ff-only
+  as_rs "git -C '${DEPLOY_DIR}' pull --ff-only"
 else
-  sudo -u "$RS_USER" git clone "$DEPLOY_REPO" "$DEPLOY_DIR"
+  as_rs "git clone '${DEPLOY_REPO}' '${DEPLOY_DIR}'"
   ok "Repo cloned to ${DEPLOY_DIR}"
 fi
 
@@ -367,7 +375,6 @@ else
   info "Inventory already exists — leaving intact"
 fi
 
-# Ensure host_vars directory exists
 mkdir -p "${INVENTORY_DIR}/host_vars"
 chown -R "${RS_USER}:${RS_USER}" "${INVENTORY_DIR}"
 
@@ -427,7 +434,6 @@ fi
 # =============================================================================
 header "Starting One-Shot Ansible Key Server"
 
-ANSIBLE_PUBKEY_CONTENT=$(cat "${ANSIBLE_KEY}.pub")
 ANSIBLE_IP=$(ip -4 addr show scope global \
   | grep -o 'inet [0-9.]*' | awk '{print $2}' | head -1 || echo "<ansible-vm-ip>")
 
