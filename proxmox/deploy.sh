@@ -46,6 +46,16 @@
 #   Dept and Corp roles are passed to server.sh as RS_DEPT_NIC_HINT /
 #   RS_CORP_NIC_HINT so it can pre-populate the correct interface names in .env.
 #
+# Connection method selection:
+#   Department NICs always use bridge (shared Proxmox bridge, e.g. vmbr0).
+#   Corporate NICs always use USB NIC passthrough when a free USB NIC is
+#   available — the question is skipped and USB is selected automatically.
+#   This is by design: Cisco port security allows only one approved MAC per
+#   switch port; USB passthrough gives the VM a fixed, exclusive MAC address.
+#   If no free USB NICs are available for a Corporate NIC, the script warns
+#   the tech and falls back to bridge with a note about MAC isolation.
+#   Other NICs always prompt the tech to choose bridge or USB.
+#
 # Usage: bash proxmox/deploy.sh
 # =============================================================================
 
@@ -503,19 +513,7 @@ configure_vm_nics() {
     echo ""
     echo -e "${BOLD}--- ${vm_label}: vNIC${nic_num} ---${RESET}"
 
-    # --- NIC role + network label (single combined question) ---
-    #
-    # Role 1 = Department/RideStatus: the NIC that carries edge node traffic,
-    #   chrony NTP, and the management UI. server.sh binds its services here.
-    #   RS_DEPT_NIC_HINT is passed to server.sh so it can pre-select this NIC.
-    #
-    # Role 2 = Corporate/external: internet access and corporate VLAN traffic.
-    #   RS_CORP_NIC_HINT is passed to server.sh for .env pre-population.
-    #
-    # Role 3 = Other / additional: the NIC is attached to the VM and given an
-    #   IP address, but no service hint is sent to server.sh. Use this for
-    #   additional VLANs, storage networks, management interfaces, etc.
-    #   server.sh will not pre-select this NIC for any RideStatus service.
+    # --- NIC role ---
     local role_opts=(
       "Department / RideStatus network  (edge traffic, management UI, NTP)"
       "Corporate / external network     (internet, corporate VLAN)"
@@ -549,7 +547,21 @@ configure_vm_nics() {
     [[ "$nic_role" == "dept" ]] && NIC_ROLE_DEPT_IDX=$(( nic_num - 1 ))
     [[ "$nic_role" == "corp" ]] && NIC_ROLE_CORP_IDX=$(( nic_num - 1 ))
 
-    local method_opts=("Bridge to onboard NIC (shared, no MAC isolation)")
+    # --- Connection method ---
+    #
+    # Department NICs: always bridge — they share the Proxmox bridge (vmbr0)
+    # which connects to the onboard NIC on the dept/RideStatus network.
+    #
+    # Corporate NICs: always USB NIC passthrough when a free USB NIC is
+    # available. The question is skipped — USB is selected automatically.
+    # Reason: Cisco port security allows one approved MAC per switch port.
+    # USB passthrough gives the VM the USB adapter's fixed, exclusive MAC.
+    # Bridging would expose multiple VM MACs on the same port and trigger
+    # a port security violation. If no free USB NICs are available, the
+    # script warns the tech and falls back to bridge.
+    #
+    # Other NICs: tech chooses bridge or USB.
+
     local available_usb=()
     for u in "${FREE_USB_NICS[@]:-}"; do
       local already=false
@@ -558,16 +570,48 @@ configure_vm_nics() {
       done
       $already || available_usb+=("$u")
     done
-    [[ ${#available_usb[@]} -gt 0 ]] && \
-      method_opts+=("USB NIC passthrough (exclusive, stable MAC)")
-
-    local method_idx=0
-    pick_menu method_idx "How should vNIC${nic_num} connect?" "${method_opts[@]}"
 
     local nic_type="" bridge_name="" usb_iface="" nic_mac="" ip_cidr="" gw="" dns=""
 
-    if [[ $method_idx -eq 0 ]]; then
+    if [[ "$nic_role" == "dept" ]]; then
+      # Department NIC — always bridge, no question needed
       nic_type="bridge"
+      echo ""
+      info "Department NIC — will connect via bridge to the RideStatus/dept network."
+
+    elif [[ "$nic_role" == "corp" ]]; then
+      # Corporate NIC — auto-select USB passthrough if available
+      if [[ ${#available_usb[@]} -gt 0 ]]; then
+        nic_type="usb"
+        echo ""
+        info "Corporate NIC — automatically using USB NIC passthrough."
+        info "  USB passthrough gives this VM an exclusive, fixed MAC address,"
+        info "  which is required for Cisco port security on the corporate switch port."
+      else
+        # No free USB NICs — warn and fall back to bridge
+        nic_type="bridge"
+        echo ""
+        warn "Corporate NIC — no free USB NICs available for passthrough."
+        warn "  Falling back to bridge. Note: if this switch port uses Cisco port"
+        warn "  security, you may need to approve the VM's MAC address separately."
+      fi
+
+    else
+      # Other NIC — let the tech choose
+      local method_opts=("Bridge to onboard NIC (shared, no MAC isolation)")
+      [[ ${#available_usb[@]} -gt 0 ]] && \
+        method_opts+=("USB NIC passthrough (exclusive, stable MAC)")
+      local method_idx=0
+      pick_menu method_idx "How should vNIC${nic_num} connect?" "${method_opts[@]}"
+      if [[ $method_idx -eq 0 ]]; then
+        nic_type="bridge"
+      else
+        nic_type="usb"
+      fi
+    fi
+
+    # --- Bridge selection (dept, corp fallback, or other-bridge) ---
+    if [[ "$nic_type" == "bridge" ]]; then
       local bridge_opts=()
       for b in "${EXISTING_BRIDGES[@]:-}"; do bridge_opts+=("$b (existing)"); done
       bridge_opts+=("Create a new bridge")
@@ -596,11 +640,11 @@ configure_vm_nics() {
       nic_mac="virtio-generated"
 
     else
-      nic_type="usb"
+      # USB passthrough
       if [[ ${#available_usb[@]} -eq 1 ]]; then
         usb_iface=${available_usb[0]}
         nic_mac=${USB_NIC_MAC[$usb_iface]:-unknown}
-        info "Using only available free USB NIC: ${usb_iface}  MAC=${nic_mac}  bus=${USB_NIC_BUS_PATH[$usb_iface]:-unknown}"
+        ok "Using USB NIC: ${usb_iface}  MAC=${nic_mac}  bus=${USB_NIC_BUS_PATH[$usb_iface]:-unknown}"
       else
         local usb_opts=()
         for u in "${available_usb[@]}"; do
