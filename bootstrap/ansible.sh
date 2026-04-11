@@ -21,9 +21,9 @@
 #      can fetch the Ansible public key automatically.
 #
 # User switching:
-#   Uses runuser -l ridestatus -c "..." for all commands that must run as the
-#   ridestatus user. This correctly sets HOME, PATH, and environment without
-#   requiring a TTY.
+#   SSH keypairs are generated as root then chowned to ridestatus — this avoids
+#   quoting issues with empty passphrases inside runuser -c "...". All other
+#   user-context operations (git, ansible config) use runuser -l ridestatus -c.
 #
 # Interactive reads:
 #   All prompts use /dev/tty so they work when the script is piped from curl.
@@ -45,6 +45,17 @@ header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
 
 # Run a command as the ridestatus user with a proper login environment.
 as_rs() { runuser -l ridestatus -c "$1"; }
+
+# Generate an SSH keypair as root then chown to ridestatus.
+# Usage: gen_keypair /path/to/key "comment"
+# This avoids the quoting problem with empty passphrases inside runuser -c "...".
+gen_keypair() {
+  local keyfile=$1 comment=$2
+  ssh-keygen -t ed25519 -f "$keyfile" -N "" -C "$comment" -q
+  chmod 600 "$keyfile"
+  chmod 644 "${keyfile}.pub"
+  chown "${RS_USER}:${RS_USER}" "$keyfile" "${keyfile}.pub"
+}
 
 # All interactive reads go through /dev/tty so they work when stdin is a pipe.
 prompt_tty() {
@@ -155,7 +166,7 @@ if [[ -f "${ANSIBLE_KEY}" ]]; then
   warn "Ansible keypair already exists at ${ANSIBLE_KEY} — leaving intact"
   warn "To rotate: rm ${ANSIBLE_KEY} ${ANSIBLE_KEY}.pub and re-run"
 else
-  as_rs "ssh-keygen -t ed25519 -f '${ANSIBLE_KEY}' -N '' -C 'ansible@ridestatus' -q"
+  gen_keypair "${ANSIBLE_KEY}" "ansible@ridestatus"
   ok "Keypair generated: ${ANSIBLE_KEY}"
 fi
 
@@ -199,9 +210,9 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
   done
 
   if [[ "$GITHUB_AUTH_METHOD" == "1" ]]; then
-    # Deploy key — generate as ridestatus user so ownership is correct
+    # Deploy key — generate as root then chown
     if [[ ! -f "${GITHUB_KEY}" ]]; then
-      as_rs "ssh-keygen -t ed25519 -f '${GITHUB_KEY}' -N '' -C 'ridestatus-ansible-deploy' -q"
+      gen_keypair "${GITHUB_KEY}" "ridestatus-ansible-deploy"
       ok "GitHub deploy key generated: ${GITHUB_KEY}"
     fi
 
@@ -285,7 +296,6 @@ EOF
       chmod 600 "${RS_HOME}/.git-credentials"
       chown "${RS_USER}:${RS_USER}" "${RS_HOME}/.git-credentials"
 
-      # Test access
       echo ""
       info "Testing PAT access..."
       TEST_PASS=true
@@ -306,7 +316,6 @@ EOF
         ok "All private repos accessible via PAT"
       fi
 
-      # Update group_vars so Ansible uses HTTPS URLs when PAT is configured
       GV_ALL="${DEPLOY_DIR}/ansible/group_vars/all.yml"
       if [[ -f "$GV_ALL" ]] && grep -q 'ridestatus_ride_repo:' "$GV_ALL"; then
         sed -i "s|ridestatus_ride_repo:.*|ridestatus_ride_repo: https://github.com/RideStatus/ridestatus-ride.git|" "$GV_ALL"
