@@ -24,8 +24,13 @@
 #   ANSIBLE_VM_HOST           — IP of the Ansible Controller VM
 #   RS_DEFAULT_ROUTE_NIC_HINT — vNIC index hint for DEFAULT_ROUTE_INTERFACE
 #
-# Interactive reads use /dev/tty explicitly so the script works when piped
-# from curl (stdin is the pipe, not the terminal).
+# User switching:
+#   The script runs as root but uses runuser -l ridestatus -c "..." for all
+#   commands that must run as the ridestatus user. This correctly sets HOME,
+#   PATH, and environment variables for that user without requiring a TTY.
+#
+# Interactive reads:
+#   All prompts use /dev/tty so they work when the script is piped from curl.
 #
 # Usage (called by deploy.sh via SSH, or manually):
 #   curl -fsSL .../bootstrap/server.sh | sudo bash
@@ -42,8 +47,12 @@ warn()   { echo -e "${YELLOW}[server.sh]${RESET} $*"; }
 die()    { echo -e "${RED}[server.sh] ERROR:${RESET} $*" >&2; exit 1; }
 header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
 
-# All interactive reads go through /dev/tty so they work when stdin is a pipe
-# (e.g. curl ... | sudo bash). prompt_tty VAR "message" [default]
+# Run a command as the ridestatus user with a proper login environment.
+# Usage: as_rs "command string"
+as_rs() { runuser -l ridestatus -c "$1"; }
+
+# All interactive reads go through /dev/tty so they work when stdin is a pipe.
+# prompt_tty VARNAME "Display message" ["default value"]
 prompt_tty() {
   local -n _pt_var=$1; local msg=$2; local def=${3:-}
   local prompt
@@ -116,7 +125,7 @@ apt-get install -y --no-install-recommends \
   python3 \
   openssh-client
 
-# PM2
+# PM2 — install globally as root, available system-wide
 if ! command -v pm2 &>/dev/null; then
   npm install -g pm2 --silent
   ok "PM2 installed"
@@ -177,7 +186,7 @@ ok "Home directory ready: ${RS_HOME}"
 header "Ansible Public Key"
 
 if [[ -f "$ANSIBLE_PUBKEY_PATH" ]]; then
-  info "Ansible public key already installed at ${ANSIBLE_PUBKEY_PATH} — skipping fetch"
+  info "Ansible public key already installed at ${ANSIBLE_PUBKEY_PATH} — skipping"
 else
   if [[ -z "$ANSIBLE_KEY_URL" ]]; then
     echo ""
@@ -201,8 +210,8 @@ else
     ok "Ansible public key installed at ${ANSIBLE_PUBKEY_PATH}"
   else
     warn "Could not fetch Ansible public key from ${ANSIBLE_KEY_URL}"
-    warn "Either the key server timed out, or the Ansible VM is unreachable."
-    warn "You can install the key manually later:"
+    warn "The key server may have timed out or the Ansible VM is unreachable."
+    warn "Install manually later:"
     warn "  scp ridestatus@<ansible-ip>:~/.ssh/ansible_ridestatus.pub ${ANSIBLE_PUBKEY_PATH}"
     warn "  Then update ANSIBLE_PUBKEY_PATH in ${SERVER_DIR}/.env"
   fi
@@ -217,6 +226,9 @@ GITHUB_CREDS_CONFIGURED=false
 
 if [[ -f "${GITHUB_KEY}" ]]; then
   info "GitHub deploy key already present — skipping setup"
+  GITHUB_CREDS_CONFIGURED=true
+elif [[ -f "${RS_HOME}/.git-credentials" ]]; then
+  info "GitHub PAT credentials already present — skipping setup"
   GITHUB_CREDS_CONFIGURED=true
 fi
 
@@ -236,12 +248,9 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
   done
 
   if [[ "$GITHUB_AUTH_METHOD" == "1" ]]; then
-    # Deploy key
+    # Deploy key — generate as ridestatus user so ownership is correct
     if [[ ! -f "${GITHUB_KEY}" ]]; then
-      sudo -u "$RS_USER" ssh-keygen \
-        -t ed25519 -f "${GITHUB_KEY}" -N "" -C "ridestatus-server-deploy" -q
-      chmod 600 "${GITHUB_KEY}"
-      chmod 644 "${GITHUB_KEY}.pub"
+      as_rs "ssh-keygen -t ed25519 -f '${GITHUB_KEY}' -N '' -C 'ridestatus-server-deploy' -q"
       ok "GitHub deploy key generated: ${GITHUB_KEY}"
     fi
 
@@ -260,6 +269,7 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
     _enter=""
     read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")" _enter </dev/tty
 
+    # Configure SSH for github.com as ridestatus user
     SSH_CONFIG="${RS_HOME}/.ssh/config"
     if ! grep -q "Host github.com" "$SSH_CONFIG" 2>/dev/null; then
       cat >> "$SSH_CONFIG" << EOF
@@ -278,7 +288,7 @@ EOF
     SERVER_REPO="git@github.com:RideStatus/ridestatus-server.git"
 
     info "Testing deploy key access..."
-    if sudo -u "$RS_USER" git ls-remote "$SERVER_REPO" HEAD &>/dev/null; then
+    if as_rs "git ls-remote '${SERVER_REPO}' HEAD" &>/dev/null; then
       ok "ridestatus-server — access confirmed"
     else
       warn "Could not verify deploy key access — check the key was added correctly"
@@ -295,13 +305,13 @@ EOF
     prompt_tty_secret GITHUB_PAT "GitHub PAT (input hidden)"
 
     if [[ -n "$GITHUB_USER" && -n "$GITHUB_PAT" ]]; then
-      sudo -u "$RS_USER" git config --global credential.helper store
+      as_rs "git config --global credential.helper store"
       echo "https://${GITHUB_USER}:${GITHUB_PAT}@github.com" \
         > "${RS_HOME}/.git-credentials"
       chmod 600 "${RS_HOME}/.git-credentials"
       chown "${RS_USER}:${RS_USER}" "${RS_HOME}/.git-credentials"
 
-      if sudo -u "$RS_USER" git ls-remote "$SERVER_REPO" HEAD &>/dev/null; then
+      if as_rs "git ls-remote '${SERVER_REPO}' HEAD" &>/dev/null; then
         ok "ridestatus-server — access confirmed"
       else
         warn "Could not verify PAT access — check PAT scopes"
@@ -319,9 +329,9 @@ header "Cloning ridestatus-server"
 
 if [[ -d "${SERVER_DIR}/.git" ]]; then
   info "Repo already cloned — pulling latest"
-  sudo -u "$RS_USER" git -C "$SERVER_DIR" pull --ff-only
+  as_rs "git -C '${SERVER_DIR}' pull --ff-only"
 else
-  sudo -u "$RS_USER" git clone "$SERVER_REPO" "$SERVER_DIR"
+  as_rs "git clone '${SERVER_REPO}' '${SERVER_DIR}'"
   ok "Repo cloned to ${SERVER_DIR}"
 fi
 
@@ -346,14 +356,19 @@ else
   info "Using existing PostgreSQL password"
 fi
 
-sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" \
-  | grep -q 1 || sudo -u postgres psql \
-    -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}';"
+# Create user if not exists
+if ! sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" \
+    | grep -q 1 2>/dev/null; then
+  sudo -u postgres psql -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}';"
+fi
 
-sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" \
-  | grep -q 1 || sudo -u postgres createdb \
-    -O "$DB_USER" "$DB_NAME"
+# Create database if not exists
+if ! sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" \
+    | grep -q 1 2>/dev/null; then
+  sudo -u postgres createdb -O "$DB_USER" "$DB_NAME"
+fi
 
+# Ensure password is current (idempotent)
 sudo -u postgres psql -c "ALTER USER ${DB_USER} WITH PASSWORD '${DB_PASS}';" &>/dev/null
 
 ok "PostgreSQL database '${DB_NAME}' and user '${DB_USER}' ready"
@@ -369,7 +384,7 @@ DEFAULT_IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' |
 
 if [[ -f "$ENV_FILE" ]]; then
   warn ".env already exists at ${ENV_FILE} — leaving intact"
-  warn "To reconfigure, delete ${ENV_FILE} and re-run server.sh"
+  warn "To reconfigure: rm ${ENV_FILE} && server.sh"
 else
   echo ""
   echo -e "${BOLD}Park Configuration${RESET}"
@@ -384,29 +399,31 @@ else
   echo "                    America/Denver   Europe/London     Australia/Sydney"
   prompt_tty PARK_TZ "Timezone" "America/Chicago"
 
-  timedatectl set-timezone "$PARK_TZ" 2>/dev/null || warn "Could not set system timezone to ${PARK_TZ}"
+  timedatectl set-timezone "$PARK_TZ" 2>/dev/null \
+    || warn "Could not set system timezone to ${PARK_TZ}"
 
   echo ""
-  prompt_tty API_KEY "API key for edge node authentication (or Enter to generate)"
+  prompt_tty API_KEY "API key for edge node authentication (Enter to generate)"
   if [[ -z "$API_KEY" ]]; then
     API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
     ok "Generated API key: ${API_KEY}"
   fi
 
   echo ""
-  prompt_tty BOOTSTRAP_TOKEN "Bootstrap token for edge node enrollment (max 8 chars, or Enter to generate)"
+  prompt_tty BOOTSTRAP_TOKEN "Bootstrap token for edge enrollment (max 8 chars, Enter to generate)"
   if [[ -z "$BOOTSTRAP_TOKEN" ]]; then
-    BOOTSTRAP_TOKEN=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8)))")
+    BOOTSTRAP_TOKEN=$(python3 -c "import secrets, string; \
+      print(''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8)))")
     ok "Generated bootstrap token: ${BOOTSTRAP_TOKEN}"
   fi
   BOOTSTRAP_TOKEN="${BOOTSTRAP_TOKEN:0:8}"
 
   echo ""
-  prompt_tty WEATHER_API_KEY "WeatherAPI.com API key (or Enter to skip)"
+  prompt_tty WEATHER_API_KEY "WeatherAPI.com API key (Enter to skip)"
   prompt_tty WEATHER_ZIP "Weather ZIP code" "00000"
 
   echo ""
-  echo -e "${BOLD}SMTP alert settings (press Enter to skip each):${RESET}"
+  echo -e "${BOLD}SMTP alert settings (Enter to skip each):${RESET}"
   prompt_tty ALERT_EMAIL "  Alert email address"
   prompt_tty ALERT_SMS "  Alert SMS address"
   prompt_tty SMTP_HOST "  SMTP host"
@@ -479,26 +496,19 @@ fi
 # =============================================================================
 header "Installing Dependencies"
 
-cd "$SERVER_DIR"
-sudo -u "$RS_USER" npm install --omit=dev --silent
+as_rs "cd '${SERVER_DIR}' && npm install --omit=dev --silent"
 ok "npm install complete"
 
 header "Running Database Migrations"
 
-export PGPASSWORD="$DB_PASS"
-
-set -a
-# shellcheck disable=SC1090
-source "$ENV_FILE"
-set +a
-
-sudo -u "$RS_USER" \
+# Pass DB credentials explicitly so migrate.js connects without prompting
+as_rs "cd '${SERVER_DIR}' && \
   POSTGRES_HOST=localhost \
   POSTGRES_PORT=5432 \
-  POSTGRES_DB="$DB_NAME" \
-  POSTGRES_USER="$DB_USER" \
-  POSTGRES_PASS="$DB_PASS" \
-  node db/migrate.js
+  POSTGRES_DB=${DB_NAME} \
+  POSTGRES_USER=${DB_USER} \
+  POSTGRES_PASS=${DB_PASS} \
+  node db/migrate.js"
 
 ok "Database migrations complete"
 
@@ -510,31 +520,38 @@ header "Starting RideStatus Server (PM2)"
 mkdir -p "${LOG_DIR}"
 chown "${RS_USER}:${RS_USER}" "${LOG_DIR}"
 
+# Copy ecosystem config to RS_HOME so PM2 can find it on boot
 ECOSYSTEM_SRC="${SERVER_DIR}/ecosystem.config.js"
 ECOSYSTEM_DEST="${RS_HOME}/ecosystem.config.js"
 cp "$ECOSYSTEM_SRC" "$ECOSYSTEM_DEST"
 chown "${RS_USER}:${RS_USER}" "$ECOSYSTEM_DEST"
 
-if sudo -u "$RS_USER" pm2 describe ridestatus-server &>/dev/null; then
+# Start or reload
+if as_rs "pm2 describe ridestatus-server" &>/dev/null; then
   info "PM2 process already exists — reloading"
-  sudo -u "$RS_USER" pm2 reload ridestatus-server --update-env
+  as_rs "pm2 reload ridestatus-server --update-env"
 else
-  sudo -u "$RS_USER" pm2 start "$ECOSYSTEM_DEST"
+  as_rs "pm2 start '${ECOSYSTEM_DEST}'"
 fi
 
-sudo -u "$RS_USER" pm2 save
+as_rs "pm2 save"
 
-PM2_STARTUP=$(sudo -u "$RS_USER" pm2 startup systemd -u "$RS_USER" --hp "$RS_HOME" 2>/dev/null \
-  | grep 'sudo env' || true)
-if [[ -n "$PM2_STARTUP" ]]; then
-  eval "$PM2_STARTUP"
-  ok "PM2 startup configured"
+# Configure PM2 systemd startup.
+# pm2 startup prints a command like:
+#   sudo env PATH=... pm2 startup systemd -u ridestatus --hp /home/ridestatus
+# We capture and run it directly as root.
+PM2_STARTUP_CMD=$(as_rs "pm2 startup systemd -u ${RS_USER} --hp ${RS_HOME}" 2>/dev/null \
+  | grep -o 'sudo env PATH.*' || true)
+
+if [[ -n "$PM2_STARTUP_CMD" ]]; then
+  eval "$PM2_STARTUP_CMD"
 else
+  # Already configured or pm2 handled it inline
   pm2 startup systemd -u "$RS_USER" --hp "$RS_HOME" 2>/dev/null || true
-  ok "PM2 startup configured"
 fi
 
 systemctl enable "pm2-${RS_USER}" 2>/dev/null || true
+ok "PM2 startup configured"
 
 # =============================================================================
 # Done
