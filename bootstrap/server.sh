@@ -62,15 +62,6 @@ prompt_tty_secret() {
   echo ""
 }
 
-prompt_tty_confirm() {
-  # Returns 0 (yes) or 1 (no)
-  local msg=$1 ans
-  while true; do
-    read -rp "$(echo -e "${BOLD}${msg}${RESET} [y/n]: ")" ans </dev/tty
-    case "$ans" in [Yy]*) return 0 ;; [Nn]*) return 1 ;; *) warn "Please answer y or n." ;; esac
-  done
-}
-
 [[ $EUID -eq 0 ]] || die "Must be run as root (sudo bash server.sh)"
 
 RS_USER="ridestatus"
@@ -266,7 +257,7 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
     echo ""
     echo -e "${BOLD}  Steps: Settings → Deploy keys → Add deploy key → paste → Allow write access: NO${RESET}"
     echo ""
-    local _enter
+    _enter=""
     read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")" _enter </dev/tty
 
     SSH_CONFIG="${RS_HOME}/.ssh/config"
