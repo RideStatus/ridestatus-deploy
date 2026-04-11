@@ -46,7 +46,7 @@ GITHUB_KEY="${RS_HOME}/.ssh/github_deploy"
 INVENTORY_DIR="${RS_HOME}/inventory"
 LOG_DIR="${RS_HOME}/logs"
 KEY_SERVER_PORT=9876
-KEY_SERVER_TIMEOUT=600  # 10 minutes
+KEY_SERVER_TIMEOUT=1800  # 30 minutes
 
 # Private repos that Ansible needs to clone onto edge nodes
 PRIVATE_REPOS=("git@github.com:RideStatus/ridestatus-ride.git")
@@ -514,7 +514,7 @@ echo -e "${BOLD}${YELLOW}║  server.sh fetches the Ansible public key from:    
 echo -e "${BOLD}${YELLOW}║                                                              ║${RESET}"
 echo -e "${BOLD}${CYAN}║  http://${ANSIBLE_IP}:${KEY_SERVER_PORT}/ansible_ridestatus.pub${RESET}"
 echo -e "${BOLD}${YELLOW}║                                                              ║${RESET}"
-echo -e "${BOLD}${YELLOW}║  Exits after one fetch or 10 minutes.                        ║${RESET}"
+echo -e "${BOLD}${YELLOW}║  Exits after one fetch or 30 minutes.                        ║${RESET}"
 echo -e "${BOLD}${YELLOW}║                                                              ║${RESET}"
 echo -e "${BOLD}${YELLOW}╚══════════════════════════════════════════════════════════════╝${RESET}"
 echo ""
