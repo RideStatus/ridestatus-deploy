@@ -11,7 +11,6 @@
 #   2.  Configures chrony for NTP sync
 #   3.  Ensures the 'ridestatus' OS user exists
 #   4.  Fetches the Ansible public key from the Ansible Controller VM
-#       (via ANSIBLE_KEY_URL env var if set, otherwise prompts the tech)
 #   5.  Configures GitHub access to clone ridestatus-server (deploy key or PAT)
 #   6.  Clones ridestatus-server to /home/ridestatus/ridestatus-server
 #   7.  Creates PostgreSQL database and user
@@ -24,16 +23,13 @@
 #   ANSIBLE_VM_HOST           — IP of the Ansible Controller VM
 #   RS_DEFAULT_ROUTE_NIC_HINT — vNIC index hint for DEFAULT_ROUTE_INTERFACE
 #
-# User switching:
-#   Runs as root; uses runuser -l ridestatus -c for user-context operations.
-#   SSH keypairs are generated to a tmpdir outside ~/.ssh/ then moved in,
-#   to avoid sshd dropping the session on inotify events in ~/.ssh/.
-#
-# Interactive reads:
-#   All prompts use /dev/tty so they work when the script is piped from curl.
+# Interactive input:
+#   The script re-opens stdin from /dev/tty at startup so all prompts work
+#   correctly under sudo (which closes the controlling terminal). If /dev/tty
+#   is unavailable the script falls back to the original stdin.
 #
 # Usage (called by deploy.sh via SSH, or manually):
-#   curl -fsSL .../bootstrap/server.sh | sudo bash
+#   sudo bash /path/to/server.sh
 # =============================================================================
 
 set -euo pipefail
@@ -47,12 +43,17 @@ warn()   { echo -e "${YELLOW}[server.sh]${RESET} $*"; }
 die()    { echo -e "${RED}[server.sh] ERROR:${RESET} $*" >&2; exit 1; }
 header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
 
+# Re-open stdin from /dev/tty so interactive prompts work under sudo.
+# sudo closes the controlling terminal; this re-attaches it.
+if [[ -c /dev/tty ]]; then
+  exec </dev/tty
+fi
+
 # Run a command as the ridestatus user with a proper login environment.
 as_rs() { runuser -l ridestatus -c "$1"; }
 
 # Generate an SSH keypair safely without disturbing the active SSH session.
 # Keys are generated to a tmpdir OUTSIDE ~/.ssh/ then moved in atomically.
-# Writing directly into ~/.ssh/ can cause sshd to drop the session.
 gen_keypair() {
   local keyfile=$1 comment=$2
   local tmpdir
@@ -67,22 +68,20 @@ gen_keypair() {
   rm -rf "$tmpdir"
 }
 
-# All interactive reads go through /dev/tty so they work when stdin is a pipe.
-prompt_tty() {
-  local -n _pt_var=$1; local msg=$2; local def=${3:-}
-  local prompt
+# Simple prompt helpers — stdin is already /dev/tty from exec above.
+prompt() {
+  local -n _p_var=$1; local msg=$2; local def=${3:-}
   if [[ -n "$def" ]]; then
-    prompt="$(echo -e "${BOLD}${msg}${RESET} [${def}]: ")"
+    read -rp "$(echo -e "${BOLD}${msg}${RESET} [${def}]: ")" _p_var
+    [[ -z "$_p_var" ]] && _p_var="$def"
   else
-    prompt="$(echo -e "${BOLD}${msg}${RESET}: ")"
+    read -rp "$(echo -e "${BOLD}${msg}${RESET}: ")" _p_var
   fi
-  read -rp "$prompt" _pt_var </dev/tty
-  [[ -n "$def" && -z "$_pt_var" ]] && _pt_var="$def"
 }
 
-prompt_tty_secret() {
-  local -n _pts_var=$1; local msg=$2
-  read -rsp "$(echo -e "${BOLD}${msg}${RESET}: ")" _pts_var </dev/tty
+prompt_secret() {
+  local -n _ps_var=$1; local msg=$2
+  read -rsp "$(echo -e "${BOLD}${msg}${RESET}: ")" _ps_var
   echo ""
 }
 
@@ -210,7 +209,7 @@ else
     echo "  http://10.x.x.x:9876/ansible_ridestatus.pub"
     echo ""
     while true; do
-      prompt_tty ANSIBLE_KEY_URL "Ansible key server URL"
+      prompt ANSIBLE_KEY_URL "Ansible key server URL"
       [[ -n "$ANSIBLE_KEY_URL" ]] && break
       warn "URL is required."
     done
@@ -257,7 +256,7 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
 
   GITHUB_AUTH_METHOD=""
   while true; do
-    prompt_tty GITHUB_AUTH_METHOD "Choose" "1"
+    prompt GITHUB_AUTH_METHOD "Choose" "1"
     [[ "$GITHUB_AUTH_METHOD" =~ ^[12]$ ]] && break
     warn "Enter 1 or 2."
   done
@@ -282,7 +281,7 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
     echo -e "${BOLD}  Steps: Settings → Deploy keys → Add deploy key → paste → Allow write access: NO${RESET}"
     echo ""
     _enter=""
-    read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")" _enter </dev/tty
+    read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")" _enter
 
     # Configure SSH for github.com
     SSH_CONFIG="${RS_HOME}/.ssh/config"
@@ -316,8 +315,8 @@ EOF
     echo "  Token type: Classic"
     echo "  Scopes needed: repo (read-only is sufficient)"
     echo ""
-    prompt_tty GITHUB_USER "GitHub username"
-    prompt_tty_secret GITHUB_PAT "GitHub PAT (input hidden)"
+    prompt GITHUB_USER "GitHub username"
+    prompt_secret GITHUB_PAT "GitHub PAT (input hidden)"
 
     if [[ -n "$GITHUB_USER" && -n "$GITHUB_PAT" ]]; then
       as_rs "git config --global credential.helper store"
@@ -406,26 +405,26 @@ else
   echo "  These values are written to .env and can be changed later."
   echo ""
 
-  prompt_tty PARK_NAME "Park name"
+  prompt PARK_NAME "Park name"
   [[ -z "$PARK_NAME" ]] && PARK_NAME="My Park"
 
   echo ""
   echo "  Common timezones: America/Chicago  America/New_York  America/Los_Angeles"
   echo "                    America/Denver   Europe/London     Australia/Sydney"
-  prompt_tty PARK_TZ "Timezone" "America/Chicago"
+  prompt PARK_TZ "Timezone" "America/Chicago"
 
   timedatectl set-timezone "$PARK_TZ" 2>/dev/null \
     || warn "Could not set system timezone to ${PARK_TZ}"
 
   echo ""
-  prompt_tty API_KEY "API key for edge node authentication (Enter to generate)"
+  prompt API_KEY "API key for edge node authentication (Enter to generate)"
   if [[ -z "$API_KEY" ]]; then
     API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
     ok "Generated API key: ${API_KEY}"
   fi
 
   echo ""
-  prompt_tty BOOTSTRAP_TOKEN "Bootstrap token for edge enrollment (max 8 chars, Enter to generate)"
+  prompt BOOTSTRAP_TOKEN "Bootstrap token for edge enrollment (max 8 chars, Enter to generate)"
   if [[ -z "$BOOTSTRAP_TOKEN" ]]; then
     BOOTSTRAP_TOKEN=$(python3 -c "import secrets, string; \
       print(''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8)))")
@@ -434,17 +433,17 @@ else
   BOOTSTRAP_TOKEN="${BOOTSTRAP_TOKEN:0:8}"
 
   echo ""
-  prompt_tty WEATHER_API_KEY "WeatherAPI.com API key (Enter to skip)"
-  prompt_tty WEATHER_ZIP "Weather ZIP code" "00000"
+  prompt WEATHER_API_KEY "WeatherAPI.com API key (Enter to skip)"
+  prompt WEATHER_ZIP "Weather ZIP code" "00000"
 
   echo ""
   echo -e "${BOLD}SMTP alert settings (Enter to skip each):${RESET}"
-  prompt_tty ALERT_EMAIL "  Alert email address"
-  prompt_tty ALERT_SMS "  Alert SMS address"
-  prompt_tty SMTP_HOST "  SMTP host"
-  prompt_tty SMTP_PORT "  SMTP port" "587"
-  prompt_tty SMTP_USER "  SMTP username"
-  prompt_tty_secret SMTP_PASS "  SMTP password (hidden)"
+  prompt ALERT_EMAIL "  Alert email address"
+  prompt ALERT_SMS "  Alert SMS address"
+  prompt SMTP_HOST "  SMTP host"
+  prompt SMTP_PORT "  SMTP port" "587"
+  prompt SMTP_USER "  SMTP username"
+  prompt_secret SMTP_PASS "  SMTP password (hidden)"
 
   cat > "$ENV_FILE" << EOF
 # =============================================================================
