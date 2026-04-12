@@ -36,6 +36,7 @@ command -v pvesm     >/dev/null 2>&1 || die "pvesm not found — is this a Proxm
 command -v qm        >/dev/null 2>&1 || die "qm not found — is this a Proxmox host?"
 command -v dialog    >/dev/null 2>&1 || die "dialog not found (apt install dialog)"
 command -v ssh       >/dev/null 2>&1 || die "ssh not found"
+command -v scp       >/dev/null 2>&1 || die "scp not found"
 command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen not found"
 command -v python3   >/dev/null 2>&1 || die "python3 not found"
 command -v curl      >/dev/null 2>&1 || die "curl not found"
@@ -59,7 +60,6 @@ wt_msg() {
   dialog --title "RideStatus Deploy" --msgbox "$1" $WT_H $WT_W
 }
 
-# wt_input VARNAME "prompt" "default"
 wt_input() {
   local _varname=$1 _prompt=$2 _default=${3:-}
   dialog --title "RideStatus Deploy" --inputbox "$_prompt" 10 $WT_W "$_default" \
@@ -70,7 +70,6 @@ wt_input() {
   printf -v "$_varname" '%s' "$_val"
 }
 
-# wt_password VARNAME "prompt"
 wt_password() {
   local _varname=$1 _prompt=$2
   dialog --title "RideStatus Deploy" --passwordbox "$_prompt" 10 $WT_W \
@@ -80,7 +79,6 @@ wt_password() {
   printf -v "$_varname" '%s' "$_val"
 }
 
-# wt_menu VARNAME "prompt" tag1 desc1 tag2 desc2 ...
 wt_menu() {
   local _varname=$1 _prompt=$2; shift 2
   dialog --title "RideStatus Deploy" --menu "$_prompt" $WT_H $WT_W 8 "$@" \
@@ -90,7 +88,6 @@ wt_menu() {
   printf -v "$_varname" '%s' "$_val"
 }
 
-# wt_yesno "prompt" — returns 0=yes 1=no
 wt_yesno() {
   dialog --title "RideStatus Deploy" --yesno "$1" 10 $WT_W
 }
@@ -519,33 +516,32 @@ purge_known_host() {
 }
 first_ip() { local -n _f=$1; echo "${_f[0]%%/*}"; }
 
+# SSH using deploy key first, admin key as fallback
+_ssh_opts() { echo "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes"; }
+
 deploy_ssh() {
   local tty_flag=false
   [[ "${1:-}" == "-t" ]] && tty_flag=true && shift
   local ip=$1; shift
-  local opts=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5)
-  if $tty_flag; then
-    opts+=(-t -t)
-    ssh -i "$DEPLOY_KEY" "${opts[@]}" "ridestatus@${ip}" "$@"
-    local rc=$?
-    [[ $rc -eq 255 && -f "$ADMIN_KEY_PATH" ]] && \
-      ssh -i "$ADMIN_KEY_PATH" "${opts[@]}" "ridestatus@${ip}" "$@"
-    return $rc
-  else
-    opts+=(-o BatchMode=yes)
-    ssh -i "$DEPLOY_KEY" "${opts[@]}" "ridestatus@${ip}" "$@" 2>/dev/null && return 0
-    local rc=$?
-    [[ $rc -eq 255 && -f "$ADMIN_KEY_PATH" ]] && \
-      ssh -i "$ADMIN_KEY_PATH" "${opts[@]}" "ridestatus@${ip}" "$@" 2>/dev/null && return 0
-    return $rc
-  fi
+  local extra_opts=""
+  $tty_flag && extra_opts="-t -t" || extra_opts="-o BatchMode=yes"
+
+  # Try deploy key first, then admin key
+  for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
+    [[ -f "$key" ]] || continue
+    # shellcheck disable=SC2086
+    if ssh -i "$key" $(_ssh_opts) $extra_opts "ridestatus@${ip}" "$@" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 wait_for_ssh() {
   local ip=$1 elapsed=0
   info "Waiting for SSH on ${ip}..."
   while (( elapsed < 300 )); do
-    deploy_ssh "$ip" 'exit 0' &>/dev/null && { ok "SSH ready on ${ip}"; return 0; }
+    deploy_ssh "$ip" 'exit 0' && { ok "SSH ready on ${ip}"; return 0; }
     sleep 5; elapsed=$(( elapsed+5 )); echo -n "."
   done
   echo ""; die "Timed out waiting for SSH on ${ip}"
@@ -714,7 +710,7 @@ fix_usb_nic_names() {
 
 # =============================================================================
 # Bootstrap runner
-# Env vars are base64-encoded to safely transfer over SSH without quoting issues.
+# Writes env file locally then SCPs it — avoids SSH key timing/quoting issues.
 # =============================================================================
 run_bootstrap() {
   local ip=$1 script=$2 env_vars=${3:-}
@@ -722,18 +718,43 @@ run_bootstrap() {
 
   local remote_script="/tmp/ridestatus-bs-$$.sh"
   local remote_env="/tmp/ridestatus-env-$$.sh"
+  local local_script local_env
+  local_script=$(mktemp /tmp/ridestatus-local-script-XXXXXX.sh)
+  local_env=$(mktemp /tmp/ridestatus-local-env-XXXXXX.sh)
 
-  deploy_ssh "$ip" \
-    "curl -fsSL -H 'Cache-Control: no-cache' \
-      '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) -o '${remote_script}'" \
-    || { err "Failed to download ${script}"; return 1; }
+  # Download bootstrap script locally first
+  curl -fsSL -H "Cache-Control: no-cache" \
+    "${BOOTSTRAP_BASE_URL}/${script}?$(date +%s)" -o "$local_script" \
+    || { err "Failed to download ${script}"; rm -f "$local_script" "$local_env"; return 1; }
 
+  # Write env file locally (no quoting issues at all)
   if [[ -n "$env_vars" ]]; then
-    local env_b64
-    env_b64=$(printf '%s\n' "$env_vars" | sed 's/^/export /' | base64 -w0)
-    deploy_ssh "$ip" "echo '${env_b64}' | base64 -d > '${remote_env}'" || true
+    printf '%s\n' "$env_vars" | sed 's/^/export /' > "$local_env"
   fi
 
+  # SCP both files to the VM using available key
+  local scp_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes"
+  local scp_ok=false
+  for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
+    [[ -f "$key" ]] || continue
+    # shellcheck disable=SC2086
+    if scp $scp_opts -i "$key" "$local_script" "ridestatus@${ip}:${remote_script}" 2>/dev/null; then
+      if [[ -n "$env_vars" ]]; then
+        # shellcheck disable=SC2086
+        scp $scp_opts -i "$key" "$local_env" "ridestatus@${ip}:${remote_env}" 2>/dev/null || true
+      fi
+      scp_ok=true
+      break
+    fi
+  done
+  rm -f "$local_script" "$local_env"
+
+  if ! $scp_ok; then
+    err "Failed to SCP files to ${ip}"
+    return 1
+  fi
+
+  # Execute with TTY
   if [[ -n "$env_vars" ]]; then
     deploy_ssh -t "$ip" sudo bash -c \
       ". '${remote_env}' && bash '${remote_script}'; rm -f '${remote_script}' '${remote_env}'"
@@ -746,7 +767,7 @@ run_bootstrap() {
 
   if [[ $rc -ne 0 ]]; then
     err "Bootstrap failed for ${script} on ${ip} (exit ${rc})"
-    err "Retry: ssh ridestatus@${ip}  then  sudo bash ${remote_script}"
+    err "Retry: ssh -i ${ADMIN_KEY_PATH} ridestatus@${ip}"
     return 1
   fi
   ok "${script} completed on ${ip}"
