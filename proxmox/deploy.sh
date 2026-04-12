@@ -778,21 +778,30 @@ ok "Services started"
 
 # =============================================================================
 # Automatic updates (manage role only)
-# Uses rssh_pipe — no TTY, stdin piping allowed, output streams to terminal.
+# self-update.sh is embedded here — no private repo access needed at deploy time.
+# Uses rssh_pipe for heredoc piping without terminal hijack.
 # =============================================================================
 if [[ "$VM_ROLE" == "manage" ]]; then
   header "Configuring Automatic Updates"
 
-  step "Downloading self-update script..."
-  SELF_UPDATE_LOCAL="${_WORK_DIR}/self-update.sh"
-  curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
-    -H "Accept: application/vnd.github.raw" \
-    "https://api.github.com/repos/RideStatus/ridestatus-manage/contents/backend/scripts/self-update.sh" \
-    -o "$SELF_UPDATE_LOCAL" \
-    || die "Failed to download self-update.sh"
+  step "Writing self-update script..."
+  cat > "${_WORK_DIR}/self-update.sh" <<'SELFUPDATE'
+#!/bin/sh
+# Ride Status Manage — Self Update Script
+# Run by cron every 30 min and by the self-update API endpoint.
+set -eu
+LOG_FILE="/var/log/ridestatus-self-update.log"
+APP_DIR="/opt/ridestatus"
+echo "[$(date -Iseconds)] Starting self-update..." | tee -a "$LOG_FILE"
+cd "$APP_DIR"
+docker compose pull 2>&1 | tee -a "$LOG_FILE"
+docker compose up -d 2>&1 | tee -a "$LOG_FILE"
+docker image prune -f 2>&1 | tee -a "$LOG_FILE"
+echo "[$(date -Iseconds)] Self-update complete." | tee -a "$LOG_FILE"
+SELFUPDATE
 
   step "Installing self-update script and cron job..."
-  rscp "$SELF_UPDATE_LOCAL" "$VM_IP" "/tmp/self-update.sh"
+  rscp "${_WORK_DIR}/self-update.sh" "$VM_IP" "/tmp/self-update.sh"
   rssh_pipe "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
 set -e
 install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
