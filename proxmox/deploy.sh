@@ -283,7 +283,9 @@ ssh-keygen -t ed25519 -f "$DEPLOY_KEY" -N "" -C "ridestatus-deploy-temp" -q
 DEPLOY_PUBKEY_CONTENT=$(cat "${DEPLOY_KEY}.pub")
 
 # =============================================================================
-# SSH helpers — try deploy key then admin key
+# SSH helpers
+# rssh     — non-interactive, BatchMode, no TTY (default for all remote calls)
+# rssh_tty — interactive TTY only where truly needed (docker compose pull/up)
 # =============================================================================
 _ssh_base_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes"
 
@@ -645,9 +647,11 @@ wait_ssh "$VM_IP"
 
 # =============================================================================
 # Install Docker
+# rssh (no TTY) pipes the heredoc — output streams normally without hijacking
+# the terminal session.
 # =============================================================================
 header "Installing Docker"
-rssh_tty "$VM_IP" "sudo bash -s" <<'DOCKER_INSTALL'
+rssh "$VM_IP" "sudo bash -s" <<'DOCKER_INSTALL'
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -748,6 +752,8 @@ ok "Configuration deployed"
 
 # =============================================================================
 # Start services
+# rssh_tty is used here because docker compose pull streams progress bars
+# that require a TTY to render correctly.
 # =============================================================================
 header "Starting Services"
 step "Pulling Docker images (this may take a few minutes)..."
@@ -757,6 +763,7 @@ ok "Services started"
 
 # =============================================================================
 # Automatic updates (manage role only)
+# Uses plain rssh — no TTY needed, avoids terminal session confusion.
 # =============================================================================
 if [[ "$VM_ROLE" == "manage" ]]; then
   header "Configuring Automatic Updates"
@@ -771,7 +778,7 @@ if [[ "$VM_ROLE" == "manage" ]]; then
 
   step "Installing self-update script and cron job..."
   rscp "$SELF_UPDATE_LOCAL" "$VM_IP" "/tmp/self-update.sh"
-  rssh_tty "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
+  rssh "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
 set -e
 install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
 chown root:root /opt/ridestatus/self-update.sh
@@ -780,7 +787,8 @@ chmod 644 /var/log/ridestatus-self-update.log
 echo "*/30 * * * * root /opt/ridestatus/self-update.sh >> /var/log/ridestatus-self-update.log 2>&1" \
   > /etc/cron.d/ridestatus-manage-update
 chmod 644 /etc/cron.d/ridestatus-manage-update
-apt-get install -y --no-install-recommends unattended-upgrades update-notifier-common
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  unattended-upgrades update-notifier-common
 tee /etc/apt/apt.conf.d/50unattended-upgrades > /dev/null <<'CONF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
@@ -795,7 +803,6 @@ APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 CONF
 systemctl enable --now unattended-upgrades
-echo "Automatic updates configured"
 AUTO_UPDATE
   ok "Self-update cron installed (every 30 min)"
   ok "unattended-upgrades enabled (security patches, no auto-reboot)"
