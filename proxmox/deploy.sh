@@ -9,6 +9,10 @@
 #
 # No bootstrap scripts. No PM2. No Ansible installs. Docker handles everything.
 #
+# NOTE: This script uses Proxmox-local CLI tools (pvesh, qm, pvesm).
+# It must be run directly on the target Proxmox host.
+# To deploy on a different host, SSH into that host first, then run this script.
+#
 # Usage:
 #   curl -fsSL -H "Accept: application/vnd.github.raw" \
 #     "https://api.github.com/repos/RideStatus/ridestatus-deploy/contents/proxmox/deploy.sh" \
@@ -447,8 +451,7 @@ All settings collected now — no prompts during deployment."
 VM_ROLE=""
 wt_menu VM_ROLE "Which VM should be created?" \
   "manage" "Management Plane — ridestatus-manage (SCADA 1)" \
-  "server" "Park Board Server — ridestatus-server (SCADA 2)" \
-  "edge"   "Edge Node — ridestatus-ride (VM-based edge node)"
+  "server" "Park Board Server — ridestatus-server (SCADA 2)"
 
 [[ -z "$VM_ROLE" ]] && { echo "Cancelled."; exit 0; }
 
@@ -463,7 +466,6 @@ done
 case "$VM_ROLE" in
   manage) default_ram=2 default_disk=20 default_host="ridestatus-manage" ;;
   server) default_ram=4 default_disk=64 default_host="ridestatus-server" ;;
-  edge)   default_ram=2 default_disk=20 default_host="ridestatus-edge"   ;;
 esac
 
 VMID="" VM_RAM="" VM_CORES="" VM_DISK="" VM_HOST=""
@@ -716,12 +718,6 @@ SMTP_USER=${SMTP_USER}
 SMTP_PASS=${SMTP_PASS}
 ENV
     ;;
-  edge)
-    cat > "$ENV_FILE" <<ENV
-NODE_ENV=production
-GITHUB_TOKEN=${GITHUB_TOKEN}
-ENV
-    ;;
 esac
 
 # Download docker-compose.yml for this role
@@ -730,10 +726,9 @@ curl -fsSL "${COMPOSE_BASE_URL}/${VM_ROLE}/docker-compose.yml" -o "$COMPOSE_FILE
   || die "Failed to download docker-compose.yml for ${VM_ROLE}"
 
 # SCP both files to VM
-rssh "$VM_IP" "mkdir -p /opt/ridestatus"
+rssh "$VM_IP" "sudo mkdir -p /opt/ridestatus && sudo chown ridestatus:ridestatus /opt/ridestatus"
 rscp "$ENV_FILE"     "$VM_IP" "/opt/ridestatus/.env"
 rscp "$COMPOSE_FILE" "$VM_IP" "/opt/ridestatus/docker-compose.yml"
-rssh "$VM_IP" "chown -R ridestatus:ridestatus /opt/ridestatus"
 ok "Files deployed"
 
 # =============================================================================
@@ -751,26 +746,23 @@ if [[ "$VM_ROLE" == "manage" ]]; then
   header "Configuring Automatic Updates"
 
   SELF_UPDATE_LOCAL="${_WORK_DIR}/self-update.sh"
-  curl -fsSL "$SELF_UPDATE_SCRIPT_URL" -o "$SELF_UPDATE_LOCAL" \
+  curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+    -H "Accept: application/vnd.github.raw" \
+    "https://api.github.com/repos/RideStatus/ridestatus-manage/contents/backend/scripts/self-update.sh" \
+    -o "$SELF_UPDATE_LOCAL" \
     || die "Failed to download self-update.sh"
   rscp "$SELF_UPDATE_LOCAL" "$VM_IP" "/tmp/self-update.sh"
 
   rssh_tty "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
 set -e
-export DEBIAN_FRONTEND=noninteractive
-
 install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
 chown root:root /opt/ridestatus/self-update.sh
-
 touch /var/log/ridestatus-self-update.log
 chmod 644 /var/log/ridestatus-self-update.log
-
 echo "*/30 * * * * root /opt/ridestatus/self-update.sh >> /var/log/ridestatus-self-update.log 2>&1" \
   > /etc/cron.d/ridestatus-manage-update
 chmod 644 /etc/cron.d/ridestatus-manage-update
-
 apt-get install -y --no-install-recommends unattended-upgrades update-notifier-common
-
 tee /etc/apt/apt.conf.d/50unattended-upgrades > /dev/null <<'CONF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
@@ -779,13 +771,11 @@ Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
 CONF
-
 tee /etc/apt/apt.conf.d/20auto-upgrades > /dev/null <<'CONF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 CONF
-
 systemctl enable --now unattended-upgrades
 echo "Automatic updates configured"
 AUTO_UPDATE
@@ -799,7 +789,7 @@ fi
 header "Deployment Complete"
 ok "VM ${VMID} (${VM_HOST}) — ${VM_IP}"
 echo ""
-rssh "$VM_IP" "docker compose -f /opt/ridestatus/docker-compose.yml ps" 2>/dev/null || true
+rssh "$VM_IP" "sudo docker compose -f /opt/ridestatus/docker-compose.yml ps" 2>/dev/null || true
 echo ""
 
 if $ADMIN_GENERATED; then
@@ -811,7 +801,7 @@ if [[ "$VM_ROLE" == "server" ]]; then
   ok "Park board: http://${VM_IP}:3000"
   ok "Bootstrap token: ${BOOTSTRAP_TOKEN}"
   ok "API key: ${API_KEY}"
-  warn "Save the bootstrap token and API key — you will need them for edge nodes"
+  warn "Save the bootstrap token and API key — you will need them to connect edge nodes"
 fi
 
 if [[ "$VM_ROLE" == "manage" ]]; then
