@@ -714,6 +714,7 @@ fix_usb_nic_names() {
 
 # =============================================================================
 # Bootstrap runner
+# Env vars are base64-encoded to safely transfer over SSH without quoting issues.
 # =============================================================================
 run_bootstrap() {
   local ip=$1 script=$2 env_vars=${3:-}
@@ -728,9 +729,9 @@ run_bootstrap() {
     || { err "Failed to download ${script}"; return 1; }
 
   if [[ -n "$env_vars" ]]; then
-    local env_content
-    env_content=$(printf '%s\n' "$env_vars" | sed 's/^/export /')
-    deploy_ssh "$ip" "printf '%s\n' $(printf '%q' "$env_content") > '${remote_env}'" || true
+    local env_b64
+    env_b64=$(printf '%s\n' "$env_vars" | sed 's/^/export /' | base64 -w0)
+    deploy_ssh "$ip" "echo '${env_b64}' | base64 -d > '${remote_env}'" || true
   fi
 
   if [[ -n "$env_vars" ]]; then
