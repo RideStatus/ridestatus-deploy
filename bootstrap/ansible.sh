@@ -21,9 +21,10 @@
 #      can fetch the Ansible public key automatically.
 #
 # User switching:
-#   SSH keypairs are generated as root then chowned to ridestatus — this avoids
-#   quoting issues with empty passphrases inside runuser -c "...". All other
-#   user-context operations (git, ansible config) use runuser -l ridestatus -c.
+#   SSH keypairs are generated as root then chowned to ridestatus. To avoid
+#   sshd dropping the session when new files are created in ~/.ssh/ (sshd
+#   watches that directory), keypairs are first generated to a temp directory
+#   outside ~/.ssh/ and then moved in atomically.
 #
 # Interactive reads:
 #   All prompts use /dev/tty so they work when the script is piped from curl.
@@ -46,15 +47,23 @@ header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
 # Run a command as the ridestatus user with a proper login environment.
 as_rs() { runuser -l ridestatus -c "$1"; }
 
-# Generate an SSH keypair as root then chown to ridestatus.
+# Generate an SSH keypair safely without disturbing the active SSH session.
+# Keys are generated to a temp directory OUTSIDE ~/.ssh/ first, then moved in
+# atomically. Writing directly into ~/.ssh/ can cause sshd to drop the session
+# because it inotify-watches that directory for authorized_keys changes.
 # Usage: gen_keypair /path/to/key "comment"
-# This avoids the quoting problem with empty passphrases inside runuser -c "...".
 gen_keypair() {
   local keyfile=$1 comment=$2
-  ssh-keygen -t ed25519 -f "$keyfile" -N "" -C "$comment" -q
+  local tmpdir
+  tmpdir=$(mktemp -d /tmp/ridestatus-keygen-XXXXXX)
+  local tmpkey="${tmpdir}/key"
+  ssh-keygen -t ed25519 -f "$tmpkey" -N "" -C "$comment" -q
+  mv "${tmpkey}"     "$keyfile"
+  mv "${tmpkey}.pub" "${keyfile}.pub"
   chmod 600 "$keyfile"
   chmod 644 "${keyfile}.pub"
   chown "${RS_USER}:${RS_USER}" "$keyfile" "${keyfile}.pub"
+  rm -rf "$tmpdir"
 }
 
 # All interactive reads go through /dev/tty so they work when stdin is a pipe.
@@ -172,15 +181,6 @@ fi
 
 # =============================================================================
 # 5. GitHub access — deploy key or PAT
-#
-# Ansible needs to clone private RideStatus repos onto edge nodes.
-# Two options:
-#   A) Deploy key — SSH keypair; public key added once to each private repo
-#      in GitHub (Settings → Deploy keys). Most secure. Recommended.
-#   B) Personal access token (PAT) — simpler, works immediately, but tied
-#      to a user account. Stored as a git credential.
-#
-# On re-run: if credentials already configured, this section is skipped.
 # =============================================================================
 header "GitHub Access for Private Repos"
 
@@ -210,7 +210,7 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
   done
 
   if [[ "$GITHUB_AUTH_METHOD" == "1" ]]; then
-    # Deploy key — generate as root then chown
+    # Deploy key — generate via temp dir to avoid sshd session drop
     if [[ ! -f "${GITHUB_KEY}" ]]; then
       gen_keypair "${GITHUB_KEY}" "ridestatus-ansible-deploy"
       ok "GitHub deploy key generated: ${GITHUB_KEY}"
