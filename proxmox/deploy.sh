@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
-# RideStatus — Proxmox Deploy Script
+# RideStatus — Proxmox Deploy Script  (v2 — Docker Compose)
 # https://github.com/RideStatus/ridestatus-deploy
 #
 # Run once per Proxmox host as root.
-# Creates RideStatus Server VM and/or Ansible Controller VM.
+# Creates a RideStatus VM, installs Docker, drops docker-compose.yml + .env,
+# and starts services with docker compose up -d.
 #
-# Flow:
-#   1. dialog TUI collects ALL configuration up front.
-#   2. VMs are created and bootstrap scripts run non-interactively via env vars.
-#   3. The only remaining interactive step is the GitHub deploy key
-#      "Press Enter" — which works reliably since it runs with a direct TTY.
+# No bootstrap scripts. No PM2. No Ansible installs. Docker handles everything.
 #
-# Usage: bash /tmp/deploy.sh   (download first, then run — dialog needs TTY)
+# Usage:
+#   curl -fsSL -H "Accept: application/vnd.github.raw" \
+#     "https://api.github.com/repos/RideStatus/ridestatus-deploy/contents/proxmox/deploy.sh" \
+#     -o /tmp/deploy.sh && bash /tmp/deploy.sh
+#
+# Requirements on Proxmox host:
+#   apt install dialog jq
 # =============================================================================
 
 set -euo pipefail
@@ -30,80 +33,77 @@ header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
 # =============================================================================
 # Preflight
 # =============================================================================
-[[ $EUID -eq 0 ]] || die "This script must be run as root."
-command -v pvesh     >/dev/null 2>&1 || die "pvesh not found — is this a Proxmox host?"
-command -v pvesm     >/dev/null 2>&1 || die "pvesm not found — is this a Proxmox host?"
-command -v qm        >/dev/null 2>&1 || die "qm not found — is this a Proxmox host?"
-command -v dialog    >/dev/null 2>&1 || die "dialog not found (apt install dialog)"
-command -v ssh       >/dev/null 2>&1 || die "ssh not found"
-command -v scp       >/dev/null 2>&1 || die "scp not found"
-command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen not found"
-command -v python3   >/dev/null 2>&1 || die "python3 not found"
-command -v curl      >/dev/null 2>&1 || die "curl not found"
-command -v jq        >/dev/null 2>&1 || die "jq not found (apt install jq)"
+[[ $EUID -eq 0 ]] || die "Must be run as root."
+command -v pvesh    >/dev/null 2>&1 || die "pvesh not found — is this a Proxmox host?"
+command -v qm       >/dev/null 2>&1 || die "qm not found"
+command -v dialog   >/dev/null 2>&1 || die "dialog not found (apt install dialog)"
+command -v scp      >/dev/null 2>&1 || die "scp not found"
+command -v ssh      >/dev/null 2>&1 || die "ssh not found"
+command -v python3  >/dev/null 2>&1 || die "python3 not found"
+command -v curl     >/dev/null 2>&1 || die "curl not found"
+command -v jq       >/dev/null 2>&1 || die "jq not found (apt install jq)"
 
 PROXMOX_NODE=$(hostname)
 ADMIN_KEY_PATH="/root/ridestatus-admin-key"
-BOOTSTRAP_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap"
-ANSIBLE_KEY_SERVER_PORT=9876
+UBUNTU_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+UBUNTU_IMG_PATH="/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img"
+SNIPPET_DIR="/var/lib/vz/snippets"
+COMPOSE_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/compose"
 
-# Temp file for dialog output — avoids $() subshell which loses the TTY
+# =============================================================================
+# Temp file for dialog output — avoids $() subshell losing the TTY
+# =============================================================================
 _DLG_TMP=$(mktemp /tmp/ridestatus-dlg-XXXXXX)
+_WORK_DIR=$(mktemp -d /tmp/ridestatus-deploy-XXXXXX)
+
+cleanup() {
+  rm -f "$_DLG_TMP"
+  rm -rf "$_WORK_DIR"
+  rm -f "${SNIPPET_DIR}/ridestatus-userdata-"*.yaml 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # =============================================================================
 # dialog helpers
-# All use $_DLG_TMP instead of $() to preserve the controlling terminal.
 # =============================================================================
 WT_H=20; WT_W=72
 
-wt_msg() {
-  dialog --title "RideStatus Deploy" --msgbox "$1" $WT_H $WT_W
-}
+wt_msg() { dialog --title "RideStatus Deploy" --msgbox "$1" $WT_H $WT_W; }
 
 wt_input() {
-  local _varname=$1 _prompt=$2 _default=${3:-}
-  dialog --title "RideStatus Deploy" --inputbox "$_prompt" 10 $WT_W "$_default" \
-    2>"$_DLG_TMP" || true
-  local _val
-  _val=$(cat "$_DLG_TMP")
-  [[ -z "$_val" && -n "$_default" ]] && _val="$_default"
-  printf -v "$_varname" '%s' "$_val"
+  local _v=$1 _p=$2 _d=${3:-}
+  dialog --title "RideStatus Deploy" --inputbox "$_p" 10 $WT_W "$_d" 2>"$_DLG_TMP" || true
+  local _val; _val=$(cat "$_DLG_TMP")
+  [[ -z "$_val" && -n "$_d" ]] && _val="$_d"
+  printf -v "$_v" '%s' "$_val"
 }
 
 wt_password() {
-  local _varname=$1 _prompt=$2
-  dialog --title "RideStatus Deploy" --passwordbox "$_prompt" 10 $WT_W \
-    2>"$_DLG_TMP" || true
-  local _val
-  _val=$(cat "$_DLG_TMP")
-  printf -v "$_varname" '%s' "$_val"
+  local _v=$1 _p=$2
+  dialog --title "RideStatus Deploy" --passwordbox "$_p" 10 $WT_W 2>"$_DLG_TMP" || true
+  printf -v "$_v" '%s' "$(cat "$_DLG_TMP")"
 }
 
 wt_menu() {
-  local _varname=$1 _prompt=$2; shift 2
-  dialog --title "RideStatus Deploy" --menu "$_prompt" $WT_H $WT_W 8 "$@" \
-    2>"$_DLG_TMP" || true
-  local _val
-  _val=$(cat "$_DLG_TMP")
-  printf -v "$_varname" '%s' "$_val"
+  local _v=$1 _p=$2; shift 2
+  dialog --title "RideStatus Deploy" --menu "$_p" $WT_H $WT_W 8 "$@" 2>"$_DLG_TMP" || true
+  printf -v "$_v" '%s' "$(cat "$_DLG_TMP")"
 }
 
-wt_yesno() {
-  dialog --title "RideStatus Deploy" --yesno "$1" 10 $WT_W
-}
+wt_yesno() { dialog --title "RideStatus Deploy" --yesno "$1" 10 $WT_W; }
 
 # =============================================================================
-# Detect storage
+# Storage detection
 # =============================================================================
 storage_json() { pvesh get /storage --output-format json 2>/dev/null || echo '[]'; }
 
 find_lvm_storage() {
-  if pvesm status --storage "local-lvm" &>/dev/null 2>&1; then echo "local-lvm"; return; fi
+  pvesm status --storage "local-lvm" &>/dev/null && echo "local-lvm" && return
   storage_json | python3 -c "
 import sys,json
 for s in json.load(sys.stdin):
     if 'images' in s.get('content',''):
-        print(s.get('storage','')); break
+        print(s['storage']); break
 " 2>/dev/null || true
 }
 
@@ -116,7 +116,7 @@ for s in stores:
         print('local'); sys.exit(0)
 for s in stores:
     if s.get('type')=='dir':
-        print(s.get('storage','')); sys.exit(0)
+        print(s['storage']); sys.exit(0)
 " 2>/dev/null || true
 }
 
@@ -130,8 +130,8 @@ for s in json.load(sys.stdin):
         print(s.get('content','')); break
 " 2>/dev/null || true)
   echo "$cur" | grep -qw "$ctype" && return 0
-  local new="${cur:+${cur},}${ctype}"
-  pvesm set "$storage" --content "$new" || die "Failed to enable ${ctype} on ${storage}"
+  pvesm set "$storage" --content "${cur:+${cur},}${ctype}" \
+    || die "Failed to enable ${ctype} on ${storage}"
 }
 
 DISK_STORAGE=$(find_lvm_storage)
@@ -140,60 +140,44 @@ CI_STORAGE=$(find_dir_storage)
 [[ -n "$CI_STORAGE" ]] || die "No directory-type storage found"
 ensure_content_type "$CI_STORAGE" "images"
 ensure_content_type "$CI_STORAGE" "snippets"
-SNIPPET_DIR="/var/lib/vz/snippets"
 mkdir -p "$SNIPPET_DIR"
 
 # =============================================================================
-# Detect USB NICs
+# USB NIC detection
 # =============================================================================
-declare -A USB_NIC_MAC=()
-declare -A USB_NIC_BUS=()
-declare -A USB_NIC_VP=()
+declare -A USB_NIC_MAC=() USB_NIC_BUS=() USB_NIC_VP=()
 declare -a FREE_USB_NICS=()
 declare -A USB_BUS_CLAIMED=()
 
 _detect_usb_nics() {
-  mapfile -t ALL_IFACES < <(
-    ip -o link show | awk -F': ' '{print $2}' \
-    | grep -v '^lo$' | grep -v '@' \
-    | grep -Ev '^(vmbr|tap|veth|fwbr|fwpr|fwln)'
-  )
-
-  for iface in "${ALL_IFACES[@]}"; do
-    local syspath
+  local iface syspath usb_dir vp bp v p
+  for iface in $(ip -o link show | awk -F': ' '{print $2}' \
+      | grep -v '^lo$' | grep -v '@' \
+      | grep -Ev '^(vmbr|tap|veth|fwbr|fwpr|fwln)'); do
     syspath=$(readlink -f "/sys/class/net/${iface}/device" 2>/dev/null || true)
     [[ -z "$syspath" ]] && continue
     echo "$syspath" | grep -q '/usb' || continue
-
-    local usb_dir vp=""
     usb_dir=$(echo "$syspath" | sed 's|/[^/]*$||')
+    vp=""
     while [[ "$usb_dir" =~ /usb ]]; do
-      local v p
       v=$(cat "${usb_dir}/idVendor"  2>/dev/null || true)
       p=$(cat "${usb_dir}/idProduct" 2>/dev/null || true)
-      if [[ -n "$v" && -n "$p" ]]; then vp="${v}:${p}"; break; fi
+      [[ -n "$v" && -n "$p" ]] && vp="${v}:${p}" && break
       usb_dir=$(dirname "$usb_dir")
     done
     [[ -z "$vp" ]] && continue
-
-    local bp
     bp=$(echo "$syspath" | grep -oP 'usb\d+/\K[\d]+-[\d.]+(?=/)' | head -1 || true)
     [[ -z "$bp" ]] && continue
-
     USB_NIC_MAC["$iface"]=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo "unknown")
     USB_NIC_BUS["$iface"]="$bp"
     USB_NIC_VP["$iface"]="$vp"
   done
 
-  mapfile -t VMIDS < <(
-    pvesh get "/nodes/${PROXMOX_NODE}/qemu" --output-format json 2>/dev/null \
-    | grep -o '"vmid":[0-9]*' | grep -o '[0-9]*' || true
-  )
-  for vmid in "${VMIDS[@]}"; do
-    local cfg
+  local vmid cfg entry raw
+  for vmid in $(pvesh get "/nodes/${PROXMOX_NODE}/qemu" --output-format json 2>/dev/null \
+      | grep -o '"vmid":[0-9]*' | grep -o '[0-9]*' || true); do
     cfg=$(pvesh get "/nodes/${PROXMOX_NODE}/qemu/${vmid}/config" --output-format json 2>/dev/null || true)
     while IFS= read -r entry; do
-      local raw
       raw=$(echo "$entry" | grep -o 'host=[^ ",]*' | sed 's/host=//' || true)
       [[ -z "$raw" ]] && continue
       echo "$raw" | grep -qP '^\d+-[\d.]+$' && USB_BUS_CLAIMED["$raw"]="$vmid"
@@ -201,11 +185,9 @@ _detect_usb_nics() {
   done
 
   for iface in "${!USB_NIC_VP[@]}"; do
-    local bp="${USB_NIC_BUS[$iface]}"
-    [[ -z "${USB_BUS_CLAIMED[$bp]:-}" ]] && FREE_USB_NICS+=("$iface")
+    [[ -z "${USB_BUS_CLAIMED[${USB_NIC_BUS[$iface]}]:-}" ]] && FREE_USB_NICS+=("$iface")
   done
 }
-
 _detect_usb_nics
 
 mapfile -t EXISTING_BRIDGES < <(
@@ -213,20 +195,180 @@ mapfile -t EXISTING_BRIDGES < <(
 )
 
 # =============================================================================
-# Temporary deploy keypair
+# Admin SSH keypair (persistent across runs)
 # =============================================================================
-DEPLOY_KEY_DIR=$(mktemp -d /tmp/ridestatus-deploy-XXXXXX)
-DEPLOY_KEY="${DEPLOY_KEY_DIR}/id_ed25519"
-DEPLOY_PUBKEY="${DEPLOY_KEY}.pub"
-ssh-keygen -t ed25519 -f "$DEPLOY_KEY" -N "" -C "ridestatus-deploy-temp" -q
-DEPLOY_PUBKEY_CONTENT=$(cat "$DEPLOY_PUBKEY")
+ADMIN_SSH_PUBKEY=""
+ADMIN_GENERATED=false
 
-cleanup() {
-  rm -rf "$DEPLOY_KEY_DIR"
-  rm -f "$_DLG_TMP"
-  rm -f "${SNIPPET_DIR}/ridestatus-userdata-"*.yaml 2>/dev/null || true
+if [[ -f "${ADMIN_KEY_PATH}.pub" ]]; then
+  ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
+else
+  ssh-keygen -t ed25519 -f "$ADMIN_KEY_PATH" -N "" -C "ridestatus-admin" -q
+  ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
+  ADMIN_GENERATED=true
+fi
+
+# Temp deploy keypair (single-use, destroyed on exit)
+DEPLOY_KEY="${_WORK_DIR}/deploy_key"
+ssh-keygen -t ed25519 -f "$DEPLOY_KEY" -N "" -C "ridestatus-deploy-temp" -q
+DEPLOY_PUBKEY_CONTENT=$(cat "${DEPLOY_KEY}.pub")
+
+# =============================================================================
+# SSH helpers — try deploy key then admin key
+# =============================================================================
+_ssh_base_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes"
+
+rssh() {
+  # rssh [opts] ip command...
+  local ip=$1; shift
+  for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
+    [[ -f "$key" ]] || continue
+    # shellcheck disable=SC2086
+    SSH_AUTH_SOCK="" ssh -i "$key" $_ssh_base_opts -o BatchMode=yes "ridestatus@${ip}" "$@" \
+      2>/dev/null && return 0
+  done
+  return 1
 }
-trap cleanup EXIT
+
+rssh_tty() {
+  local ip=$1; shift
+  for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
+    [[ -f "$key" ]] || continue
+    # shellcheck disable=SC2086
+    SSH_AUTH_SOCK="" ssh -i "$key" $_ssh_base_opts -t -t "ridestatus@${ip}" "$@" \
+      2>/dev/null && return 0
+  done
+  return 1
+}
+
+rscp() {
+  # rscp local_file ip:remote_path
+  local local_file=$1 ip=$2 remote_path=$3
+  for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
+    [[ -f "$key" ]] || continue
+    # shellcheck disable=SC2086
+    SSH_AUTH_SOCK="" scp -i "$key" $_ssh_base_opts -o BatchMode=yes \
+      "$local_file" "ridestatus@${ip}:${remote_path}" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+wait_ssh() {
+  local ip=$1 elapsed=0
+  info "Waiting for SSH on ${ip}..."
+  while (( elapsed < 300 )); do
+    rssh "$ip" 'exit 0' && { ok "SSH ready"; return 0; }
+    sleep 5; elapsed=$(( elapsed+5 )); echo -n "."
+  done
+  echo ""; die "Timed out waiting for SSH on ${ip}"
+}
+
+wait_agent() {
+  local vmid=$1 elapsed=0
+  info "Waiting for guest agent on VM ${vmid}..."
+  while (( elapsed < 300 )); do
+    qm guest cmd "$vmid" ping &>/dev/null 2>&1 && { ok "Guest agent ready"; return 0; }
+    sleep 5; elapsed=$(( elapsed+5 )); echo -n "."
+  done
+  echo ""; die "Timed out waiting for guest agent"
+}
+
+purge_known_host() {
+  ssh-keygen -f /root/.ssh/known_hosts -R "$1" &>/dev/null 2>&1 || true
+}
+
+# =============================================================================
+# NIC collection helper
+# =============================================================================
+declare -a NIC_TYPES=() NIC_BRIDGES=() NIC_USBS=() NIC_IPS=() NIC_GWS=() NIC_DR=()
+_session_claimed=()
+
+collect_nics() {
+  local vm_label=$1
+  NIC_TYPES=(); NIC_BRIDGES=(); NIC_USBS=(); NIC_IPS=(); NIC_GWS=(); NIC_DR=()
+  local dr_assigned=false nic_num=1
+
+  while true; do
+    # Connection type
+    local nic_type=""
+    local available_usb=()
+    for u in "${FREE_USB_NICS[@]:-}"; do
+      local skip=false
+      for c in "${_session_claimed[@]:-}"; do [[ "$c" == "$u" ]] && skip=true && break; done
+      $skip || available_usb+=("$u")
+    done
+
+    if [[ ${#available_usb[@]} -gt 0 ]]; then
+      local conn_items=("bridge" "Shared bridge (virtio)")
+      for u in "${available_usb[@]}"; do
+        conn_items+=("usb:${u}" "USB passthrough: ${u}  MAC=${USB_NIC_MAC[$u]}  bus=${USB_NIC_BUS[$u]}")
+      done
+      wt_menu nic_type "${vm_label} vNIC${nic_num} — Connection type:" "${conn_items[@]}"
+    else
+      nic_type="bridge"
+    fi
+
+    local bridge_name="" usb_iface=""
+    if [[ "$nic_type" == "bridge" ]]; then
+      local b_items=()
+      for b in "${EXISTING_BRIDGES[@]:-}"; do b_items+=("$b" "Existing bridge"); done
+      b_items+=("new" "Create new bridge")
+      local b_sel=""
+      wt_menu b_sel "${vm_label} vNIC${nic_num} — Bridge:" "${b_items[@]}"
+      if [[ "$b_sel" == "new" ]]; then
+        local next_num=0
+        while ip link show "vmbr${next_num}" &>/dev/null 2>&1; do next_num=$(( next_num+1 )); done
+        wt_input bridge_name "New bridge name:" "vmbr${next_num}"
+        if ! ip link show "$bridge_name" &>/dev/null 2>&1; then
+          local phys_items=()
+          for iface in $(ip -o link show | awk -F': ' '{print $2}' \
+              | grep -Ev '^(lo|vmbr|tap|veth|fwbr|fwpr|fwln)' | grep -v '@'); do
+            phys_items+=("$iface" "$(cat /sys/class/net/${iface}/address 2>/dev/null || echo unknown)")
+          done
+          local phys_sel=""
+          wt_menu phys_sel "Physical NIC for ${bridge_name}:" "${phys_items[@]}"
+          { echo "auto ${bridge_name}"
+            echo "iface ${bridge_name} inet manual"
+            echo "  bridge_ports ${phys_sel}"
+            echo "  bridge_stp off"; echo "  bridge_fd 0"
+          } > "/etc/network/interfaces.d/${bridge_name}"
+          ifup "$bridge_name" 2>/dev/null || true
+        fi
+        EXISTING_BRIDGES+=("$bridge_name")
+      else
+        bridge_name="$b_sel"
+      fi
+    else
+      usb_iface="${nic_type#usb:}"
+      nic_type="usb"
+      _session_claimed+=("$usb_iface")
+    fi
+
+    # IP
+    local ip_cidr=""
+    while true; do
+      wt_input ip_cidr "${vm_label} vNIC${nic_num} — Static IP/prefix (e.g. 10.250.5.101/19):" ""
+      [[ "$ip_cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && break
+      wt_msg "Invalid format. Example: 10.250.5.101/19"
+    done
+
+    # Default route
+    local gw="" is_dr="no"
+    if ! $dr_assigned; then
+      if wt_yesno "Use vNIC${nic_num} (${ip_cidr}) as the default route?\n\nThis NIC carries internet traffic."; then
+        is_dr="yes"; dr_assigned=true
+        wt_input gw "Default gateway:" ""
+      fi
+    fi
+
+    NIC_TYPES+=("$nic_type"); NIC_BRIDGES+=("$bridge_name")
+    NIC_USBS+=("$usb_iface"); NIC_IPS+=("$ip_cidr")
+    NIC_GWS+=("$gw");         NIC_DR+=("$is_dr")
+
+    wt_yesno "Add another NIC to ${vm_label}?" || break
+    nic_num=$(( nic_num + 1 ))
+  done
+}
 
 # =============================================================================
 # Welcome
@@ -236,350 +378,112 @@ wt_msg "Welcome to RideStatus Proxmox Deploy
 Host: ${PROXMOX_NODE}
 Storage: OS=${DISK_STORAGE}  CI=${CI_STORAGE}
 
-This wizard collects all settings before making any changes.
-Use Tab to navigate, Space/Enter to select."
+Creates a VM, installs Docker, and starts RideStatus services.
+All settings collected now — no prompts during deployment."
 
 # =============================================================================
-# VM selection
+# VM role selection
 # =============================================================================
-CREATE_ANSIBLE=false
-CREATE_SERVER=false
-VM_SEL=""
-wt_menu VM_SEL "Which VMs should be created on this host?" \
-  "both"    "Ansible Controller + RideStatus Server (recommended)" \
-  "ansible" "Ansible Controller only" \
-  "server"  "RideStatus Server only"
+VM_ROLE=""
+wt_menu VM_ROLE "Which VM should be created?" \
+  "manage" "Management Plane — ridestatus-manage (SCADA 1)" \
+  "server" "Park Board Server — ridestatus-server (SCADA 2)" \
+  "edge"   "Edge Node — ridestatus-ride (VM-based edge node)"
 
-[[ "$VM_SEL" == "both" || "$VM_SEL" == "ansible" ]] && CREATE_ANSIBLE=true
-[[ "$VM_SEL" == "both" || "$VM_SEL" == "server"  ]] && CREATE_SERVER=true
+[[ -z "$VM_ROLE" ]] && { echo "Cancelled."; exit 0; }
 
 # =============================================================================
-# NIC configuration helper
+# VM config
 # =============================================================================
-declare -a NIC_TYPES=() NIC_LABELS=() NIC_BRIDGES=() NIC_USBS=()
-declare -a NIC_MACS=() NIC_IPS=() NIC_GWS=() NIC_DNSS=() NIC_DR=()
-_session_claimed=()
+next_vmid=300
+while pvesh get "/nodes/${PROXMOX_NODE}/qemu/${next_vmid}/status" &>/dev/null 2>&1; do
+  next_vmid=$(( next_vmid + 1 ))
+done
 
-collect_nics() {
-  local vm_label=$1
-  NIC_TYPES=(); NIC_LABELS=(); NIC_BRIDGES=(); NIC_USBS=()
-  NIC_MACS=(); NIC_IPS=(); NIC_GWS=(); NIC_DNSS=(); NIC_DR=()
-  local dr_assigned=false
-  local nic_num=1
+case "$VM_ROLE" in
+  manage) default_ram=2 default_disk=20 default_host="ridestatus-manage" ;;
+  server) default_ram=4 default_disk=64 default_host="ridestatus-server" ;;
+  edge)   default_ram=2 default_disk=20 default_host="ridestatus-edge"   ;;
+esac
 
-  while true; do
-    local net_label=""
-    wt_input net_label "${vm_label} vNIC${nic_num} — Network label:" "Ride Control"
-    [[ -z "$net_label" ]] && net_label="Network ${nic_num}"
+VMID="" VM_RAM="" VM_CORES="" VM_DISK="" VM_HOST=""
+wt_input VMID     "VM ID:"              "$next_vmid"
+wt_input VM_RAM   "RAM (GB):"           "$default_ram"
+wt_input VM_CORES "CPU cores:"          "2"
+wt_input VM_DISK  "Disk (GB):"          "$default_disk"
+wt_input VM_HOST  "Hostname:"           "$default_host"
 
-    local available_usb=()
-    for u in "${FREE_USB_NICS[@]:-}"; do
-      local skip=false
-      for c in "${_session_claimed[@]:-}"; do [[ "$c" == "$u" ]] && skip=true && break; done
-      $skip || available_usb+=("$u")
-    done
-
-    local nic_type=""
-    if [[ ${#available_usb[@]} -gt 0 ]]; then
-      local conn_items=("bridge" "Shared bridge (Proxmox-assigned MAC)")
-      for u in "${available_usb[@]}"; do
-        conn_items+=("usb:${u}" "USB passthrough: ${u}  MAC=${USB_NIC_MAC[$u]}  bus=${USB_NIC_BUS[$u]}")
-      done
-      wt_menu nic_type "${vm_label} vNIC${nic_num} (${net_label}) — Connection type:" "${conn_items[@]}"
-    else
-      nic_type="bridge"
-      wt_msg "No free USB NICs available — vNIC${nic_num} will use a bridge."
-    fi
-
-    local bridge_name="" usb_iface="" nic_mac=""
-
-    if [[ "$nic_type" == "bridge" ]]; then
-      local b_items=()
-      for b in "${EXISTING_BRIDGES[@]:-}"; do b_items+=("$b" "Existing bridge"); done
-      b_items+=("new" "Create a new bridge")
-      local b_sel=""
-      wt_menu b_sel "${vm_label} vNIC${nic_num} — Select bridge:" "${b_items[@]}"
-      if [[ "$b_sel" == "new" ]]; then
-        local next_num=0
-        while ip link show "vmbr${next_num}" &>/dev/null 2>&1; do next_num=$(( next_num+1 )); done
-        wt_input bridge_name "New bridge name:" "vmbr${next_num}"
-        local phys_items=()
-        for iface in $(ip -o link show | awk -F': ' '{print $2}' \
-            | grep -Ev '^(lo|vmbr|tap|veth|fwbr|fwpr|fwln)' | grep -v '@'); do
-          phys_items+=("$iface" "$(cat /sys/class/net/${iface}/address 2>/dev/null || echo unknown)")
-        done
-        local phys_sel=""
-        wt_menu phys_sel "Physical NIC for ${bridge_name}:" "${phys_items[@]}"
-        if ! ip link show "$bridge_name" &>/dev/null 2>&1; then
-          { echo "auto ${bridge_name}"
-            echo "iface ${bridge_name} inet manual"
-            echo "  bridge_ports ${phys_sel}"
-            echo "  bridge_stp off"
-            echo "  bridge_fd 0"
-          } > "/etc/network/interfaces.d/${bridge_name}"
-          ifup "$bridge_name" 2>/dev/null || true
-        fi
-        EXISTING_BRIDGES+=("$bridge_name")
-      else
-        bridge_name="$b_sel"
-      fi
-      nic_mac="virtio"
-    else
-      usb_iface="${nic_type#usb:}"
-      nic_type="usb"
-      nic_mac="${USB_NIC_MAC[$usb_iface]:-unknown}"
-      _session_claimed+=("$usb_iface")
-    fi
-
-    local ip_cidr=""
-    while true; do
-      wt_input ip_cidr "${vm_label} vNIC${nic_num} (${net_label}) — Static IP/prefix:" ""
-      [[ "$ip_cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && break
-      wt_msg "Invalid format. Enter IP/prefix like 10.250.5.101/19"
-    done
-
-    local gw="" dns="8.8.8.8" is_dr="no"
-    if ! $dr_assigned; then
-      if wt_yesno "Use vNIC${nic_num} (${net_label}, ${ip_cidr}) as the default route for ${vm_label}?
-
-This NIC handles internet traffic (updates, alerts, weather)."; then
-        is_dr="yes"
-        dr_assigned=true
-        wt_input gw "Default gateway:" ""
-      fi
-    fi
-    wt_input dns "DNS server for vNIC${nic_num}:" "8.8.8.8"
-
-    NIC_TYPES+=("$nic_type");    NIC_LABELS+=("$net_label")
-    NIC_BRIDGES+=("$bridge_name"); NIC_USBS+=("$usb_iface")
-    NIC_MACS+=("$nic_mac");      NIC_IPS+=("$ip_cidr")
-    NIC_GWS+=("$gw");            NIC_DNSS+=("$dns")
-    NIC_DR+=("$is_dr")
-
-    wt_yesno "Add another NIC to ${vm_label}?" || break
-    nic_num=$(( nic_num + 1 ))
-  done
-}
+collect_nics "$VM_HOST"
+declare -a VM_NIC_TYPES=("${NIC_TYPES[@]}")
+declare -a VM_NIC_BRIDGES=("${NIC_BRIDGES[@]}")
+declare -a VM_NIC_USBS=("${NIC_USBS[@]}")
+declare -a VM_NIC_IPS=("${NIC_IPS[@]}")
+declare -a VM_NIC_GWS=("${NIC_GWS[@]}")
+declare -a VM_NIC_DR=("${NIC_DR[@]}")
+VM_IP="${VM_NIC_IPS[0]%%/*}"
 
 # =============================================================================
-# Ansible VM config
+# Role-specific config
 # =============================================================================
-ANSIBLE_VMID="" ANSIBLE_RAM="2" ANSIBLE_CORES="2" ANSIBLE_DISK="20" ANSIBLE_HOST="ridestatus-ansible"
-declare -a A_NIC_TYPES=() A_NIC_LABELS=() A_NIC_BRIDGES=() A_NIC_USBS=()
-declare -a A_NIC_MACS=() A_NIC_IPS=() A_NIC_GWS=() A_NIC_DNSS=() A_NIC_DR=()
-
-if $CREATE_ANSIBLE; then
-  next_vmid=300
-  while pvesh get "/nodes/${PROXMOX_NODE}/qemu/${next_vmid}/status" &>/dev/null 2>&1; do
-    next_vmid=$(( next_vmid + 1 ))
-  done
-  wt_input ANSIBLE_VMID "Ansible Controller VM ID:"  "$next_vmid"
-  wt_input ANSIBLE_RAM   "Ansible VM RAM (GB):"       "2"
-  wt_input ANSIBLE_CORES "Ansible VM CPU cores:"      "2"
-  wt_input ANSIBLE_DISK  "Ansible VM disk (GB):"      "20"
-  wt_input ANSIBLE_HOST  "Ansible VM hostname:"       "ridestatus-ansible"
-
-  collect_nics "Ansible VM"
-  A_NIC_TYPES=("${NIC_TYPES[@]}");    A_NIC_LABELS=("${NIC_LABELS[@]}")
-  A_NIC_BRIDGES=("${NIC_BRIDGES[@]}"); A_NIC_USBS=("${NIC_USBS[@]}")
-  A_NIC_MACS=("${NIC_MACS[@]}");      A_NIC_IPS=("${NIC_IPS[@]}")
-  A_NIC_GWS=("${NIC_GWS[@]}");        A_NIC_DNSS=("${NIC_DNSS[@]}")
-  A_NIC_DR=("${NIC_DR[@]}")
-fi
-
-# =============================================================================
-# Server VM config
-# =============================================================================
-SERVER_VMID="" SERVER_RAM="4" SERVER_CORES="2" SERVER_DISK="64" SERVER_HOST="ridestatus-server"
-declare -a S_NIC_TYPES=() S_NIC_LABELS=() S_NIC_BRIDGES=() S_NIC_USBS=()
-declare -a S_NIC_MACS=() S_NIC_IPS=() S_NIC_GWS=() S_NIC_DNSS=() S_NIC_DR=()
-SERVER_DR_IDX=-1
-
-if $CREATE_SERVER; then
-  next_vmid=300
-  while pvesh get "/nodes/${PROXMOX_NODE}/qemu/${next_vmid}/status" &>/dev/null 2>&1; do
-    next_vmid=$(( next_vmid + 1 ))
-  done
-  wt_input SERVER_VMID   "RideStatus Server VM ID:"   "$next_vmid"
-  wt_input SERVER_RAM    "Server VM RAM (GB):"         "4"
-  wt_input SERVER_CORES  "Server VM CPU cores:"        "2"
-  wt_input SERVER_DISK   "Server VM disk (GB):"        "64"
-  wt_input SERVER_HOST   "Server VM hostname:"         "ridestatus-server"
-
-  collect_nics "Server VM"
-  S_NIC_TYPES=("${NIC_TYPES[@]}");    S_NIC_LABELS=("${NIC_LABELS[@]}")
-  S_NIC_BRIDGES=("${NIC_BRIDGES[@]}"); S_NIC_USBS=("${NIC_USBS[@]}")
-  S_NIC_MACS=("${NIC_MACS[@]}");      S_NIC_IPS=("${NIC_IPS[@]}")
-  S_NIC_GWS=("${NIC_GWS[@]}");        S_NIC_DNSS=("${NIC_DNSS[@]}")
-  S_NIC_DR=("${NIC_DR[@]}")
-  for i in "${!S_NIC_DR[@]}"; do
-    [[ "${S_NIC_DR[$i]}" == "yes" ]] && SERVER_DR_IDX=$i && break
-  done
-fi
-
-# =============================================================================
-# Park configuration (server only)
-# =============================================================================
-PARK_NAME="My Park" PARK_TZ="America/Chicago"
-WEATHER_API_KEY="" WEATHER_ZIP="00000"
-ALERT_EMAIL="" ALERT_SMS=""
+PARK_NAME="" PARK_TZ="" API_KEY="" BOOTSTRAP_TOKEN=""
+WEATHER_API_KEY="" WEATHER_ZIP="" ALERT_EMAIL="" ALERT_SMS=""
 SMTP_HOST="" SMTP_PORT="587" SMTP_USER="" SMTP_PASS=""
+GITHUB_TOKEN=""
 
-if $CREATE_SERVER; then
-  wt_input PARK_NAME       "Park name:"                              "My Park"
-  wt_input PARK_TZ         "Timezone (e.g. America/Chicago):"        "America/Chicago"
-  wt_input WEATHER_API_KEY "WeatherAPI.com key (blank to skip):"     ""
-  wt_input WEATHER_ZIP     "Weather ZIP code:"                       "00000"
-  wt_input ALERT_EMAIL     "Alert email address (optional):"         ""
-  wt_input ALERT_SMS       "Alert SMS address (optional):"           ""
-  wt_input SMTP_HOST       "SMTP host (optional):"                   ""
-  wt_input SMTP_PORT       "SMTP port:"                              "587"
-  wt_input SMTP_USER       "SMTP username (optional):"               ""
+if [[ "$VM_ROLE" == "server" ]]; then
+  wt_input PARK_NAME       "Park name:"                       "My Park"
+  wt_input PARK_TZ         "Timezone:"                        "America/Chicago"
+  wt_input WEATHER_API_KEY "WeatherAPI.com key (blank=skip):" ""
+  wt_input WEATHER_ZIP     "Weather ZIP code:"                "00000"
+  wt_input ALERT_EMAIL     "Alert email (optional):"          ""
+  wt_input SMTP_HOST       "SMTP host (optional):"            ""
   if [[ -n "$SMTP_HOST" ]]; then
+    wt_input    SMTP_PORT "SMTP port:"     "587"
+    wt_input    SMTP_USER "SMTP username:" ""
     wt_password SMTP_PASS "SMTP password:"
   fi
+  API_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+  BOOTSTRAP_TOKEN=$(python3 -c "import secrets,string; \
+    print(''.join(secrets.choice(string.ascii_uppercase+'0123456789') for _ in range(8)))")
+fi
+
+if [[ "$VM_ROLE" == "manage" || "$VM_ROLE" == "edge" ]]; then
+  wt_password GITHUB_TOKEN "GitHub token (for pulling private images, or blank):"
 fi
 
 # =============================================================================
-# GitHub access
+# Confirm
 # =============================================================================
-GITHUB_AUTH_METHOD="deploy_key"
-GITHUB_USER="" GITHUB_PAT=""
+_summary="VM ${VMID} — ${VM_HOST} (${VM_ROLE})\n"
+_summary+="RAM: ${VM_RAM}GB  CPU: ${VM_CORES}  Disk: ${VM_DISK}GB\n"
+for i in "${!VM_NIC_TYPES[@]}"; do
+  _dr=""; [[ "${VM_NIC_DR[$i]}" == "yes" ]] && _dr=" [GW=${VM_NIC_GWS[$i]}]"
+  _summary+="  vNIC$((i+1)): ${VM_NIC_IPS[$i]}${_dr}\n"
+done
+[[ -n "$PARK_NAME" ]] && _summary+="\nPark: ${PARK_NAME}  TZ: ${PARK_TZ}"
 
-wt_menu GITHUB_AUTH_METHOD "GitHub access for private repos:" \
-  "deploy_key" "Deploy key — SSH key scoped to RideStatus repos (recommended)" \
-  "pat"        "Personal access token (PAT) — simpler, enter once"
-
-if [[ "$GITHUB_AUTH_METHOD" == "pat" ]]; then
-  wt_input    GITHUB_USER "GitHub username:" ""
-  wt_password GITHUB_PAT  "GitHub PAT:"
-fi
+wt_yesno "Confirm deployment:\n\n${_summary}\n\nProceed?" \
+  || { echo "Cancelled."; exit 0; }
 
 # =============================================================================
-# Admin SSH key
+# Ubuntu cloud image
 # =============================================================================
-ADMIN_SSH_PUBKEY="" ADMIN_GENERATED=false
-
-if [[ -f "${ADMIN_KEY_PATH}.pub" ]]; then
-  ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
-  wt_msg "Using existing admin SSH key:\n${ADMIN_KEY_PATH}"
+header "Ubuntu Image"
+if [[ -f "$UBUNTU_IMG_PATH" ]]; then
+  info "Ubuntu 24.04 cloud image cached"
 else
-  wt_input ADMIN_SSH_PUBKEY "Paste SSH public key (blank to auto-generate):" ""
-  if [[ -z "$ADMIN_SSH_PUBKEY" ]]; then
-    ssh-keygen -t ed25519 -f "$ADMIN_KEY_PATH" -N "" -C "ridestatus-admin" -q
-    ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
-    ADMIN_GENERATED=true
-    wt_msg "Admin SSH key generated:\n${ADMIN_KEY_PATH}\n\nCopy the private key to your PC after deployment."
-  fi
+  info "Downloading Ubuntu 24.04 cloud image (~600MB)..."
+  mkdir -p "$(dirname "$UBUNTU_IMG_PATH")"
+  wget -q --show-progress -O "$UBUNTU_IMG_PATH" "$UBUNTU_IMG_URL" \
+    || die "Download failed"
+  ok "Image downloaded"
 fi
 
 # =============================================================================
-# Summary + confirm
+# Write cloud-init snippet
 # =============================================================================
-_summary=""
-if $CREATE_ANSIBLE; then
-  _summary+="ANSIBLE CONTROLLER  (VM ${ANSIBLE_VMID})\n"
-  _summary+="  ${ANSIBLE_HOST}  RAM:${ANSIBLE_RAM}GB  CPU:${ANSIBLE_CORES}  Disk:${ANSIBLE_DISK}GB\n"
-  for i in "${!A_NIC_TYPES[@]}"; do
-    _c="" _d=""
-    [[ "${A_NIC_TYPES[$i]}" == "bridge" ]] && _c="bridge=${A_NIC_BRIDGES[$i]}" \
-      || _c="USB=${A_NIC_USBS[$i]}(${USB_NIC_BUS[${A_NIC_USBS[$i]}]:-?})"
-    [[ "${A_NIC_DR[$i]}" == "yes" ]] && _d=" [GW=${A_NIC_GWS[$i]}]"
-    _summary+="  vNIC$((i+1)): ${A_NIC_LABELS[$i]}  ${A_NIC_IPS[$i]}  ${_c}${_d}\n"
-  done
-  _summary+="\n"
-fi
-if $CREATE_SERVER; then
-  _summary+="RIDESTATUS SERVER  (VM ${SERVER_VMID})\n"
-  _summary+="  ${SERVER_HOST}  RAM:${SERVER_RAM}GB  CPU:${SERVER_CORES}  Disk:${SERVER_DISK}GB\n"
-  for i in "${!S_NIC_TYPES[@]}"; do
-    _c="" _d=""
-    [[ "${S_NIC_TYPES[$i]}" == "bridge" ]] && _c="bridge=${S_NIC_BRIDGES[$i]}" \
-      || _c="USB=${S_NIC_USBS[$i]}(${USB_NIC_BUS[${S_NIC_USBS[$i]}]:-?})"
-    [[ "${S_NIC_DR[$i]}" == "yes" ]] && _d=" [GW=${S_NIC_GWS[$i]}]"
-    _summary+="  vNIC$((i+1)): ${S_NIC_LABELS[$i]}  ${S_NIC_IPS[$i]}  ${_c}${_d}\n"
-  done
-  _summary+="  Park: ${PARK_NAME}  TZ: ${PARK_TZ}\n\n"
-fi
-_summary+="GitHub: ${GITHUB_AUTH_METHOD}\n"
-_summary+="Storage: OS=${DISK_STORAGE}  CI=${CI_STORAGE}"
-
-wt_yesno "Review configuration:\n\n${_summary}\n\nProceed with deployment?" \
-  || { echo "Aborted."; exit 0; }
-
-# =============================================================================
-# SSH helpers
-# =============================================================================
-iface_mac() { cat "/sys/class/net/${1}/address" 2>/dev/null || echo "unknown"; }
-purge_known_host() {
-  [[ -f /root/.ssh/known_hosts ]] && ssh-keygen -f /root/.ssh/known_hosts -R "$1" &>/dev/null || true
-}
-first_ip() { local -n _f=$1; echo "${_f[0]%%/*}"; }
-
-# SSH using deploy key first, admin key as fallback
-_ssh_opts() { echo "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes"; }
-
-deploy_ssh() {
-  local tty_flag=false
-  [[ "${1:-}" == "-t" ]] && tty_flag=true && shift
-  local ip=$1; shift
-  local extra_opts=""
-  $tty_flag && extra_opts="-t -t" || extra_opts="-o BatchMode=yes"
-
-  # Try deploy key first, then admin key
-  for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
-    [[ -f "$key" ]] || continue
-    # shellcheck disable=SC2086
-    if ssh -i "$key" $(_ssh_opts) $extra_opts "ridestatus@${ip}" "$@" 2>/dev/null; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-wait_for_ssh() {
-  local ip=$1 elapsed=0
-  info "Waiting for SSH on ${ip}..."
-  while (( elapsed < 300 )); do
-    deploy_ssh "$ip" 'exit 0' && { ok "SSH ready on ${ip}"; return 0; }
-    sleep 5; elapsed=$(( elapsed+5 )); echo -n "."
-  done
-  echo ""; die "Timed out waiting for SSH on ${ip}"
-}
-
-wait_for_agent() {
-  local vmid=$1 elapsed=0
-  info "Waiting for guest agent on VM ${vmid}..."
-  while (( elapsed < 900 )); do
-    qm guest cmd "$vmid" ping &>/dev/null 2>&1 && { ok "Guest agent ready"; return 0; }
-    sleep 10; elapsed=$(( elapsed+10 ))
-    (( elapsed % 60 == 0 )) && echo " ${elapsed}s" || echo -n "."
-  done
-  echo ""; die "Timed out waiting for guest agent on VM ${vmid}"
-}
-
-# =============================================================================
-# VM creation
-# =============================================================================
-UBUNTU_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-UBUNTU_IMG_PATH="/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img"
-
-ensure_ubuntu_image() {
-  if [[ -f "$UBUNTU_IMG_PATH" ]]; then
-    info "Ubuntu 24.04 cloud image already cached"
-  else
-    info "Downloading Ubuntu 24.04 cloud image..."
-    mkdir -p "$(dirname "$UBUNTU_IMG_PATH")"
-    wget -q --show-progress -O "$UBUNTU_IMG_PATH" "$UBUNTU_IMG_URL" \
-      || die "Failed to download Ubuntu image"
-    ok "Image downloaded"
-  fi
-}
-
-write_snippet() {
-  local vmid=$1 deploy_key=$2 admin_key=$3
-  local f="${SNIPPET_DIR}/ridestatus-userdata-${vmid}.yaml"
-  cat > "$f" <<YAML
+SNIPPET_FILE="${SNIPPET_DIR}/ridestatus-userdata-${VMID}.yaml"
+cat > "$SNIPPET_FILE" <<YAML
 #cloud-config
 users:
   - name: ridestatus
@@ -587,313 +491,190 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: true
     ssh_authorized_keys:
-      - ${deploy_key}
-      - ${admin_key}
+      - ${DEPLOY_PUBKEY_CONTENT}
+      - ${ADMIN_SSH_PUBKEY}
 packages:
   - qemu-guest-agent
 runcmd:
-  - systemctl enable qemu-guest-agent
-  - systemctl start qemu-guest-agent
+  - systemctl enable --now qemu-guest-agent
 YAML
-  echo "$f"
-}
-
-create_vm() {
-  local vmid=$1 hostname=$2 ram_gb=$3 cores=$4 disk_gb=$5
-  local -n cv_type=$6 cv_bridge=$7 cv_usb=$8 cv_ip=$9 cv_gw=${10} cv_dns=${11}
-
-  info "Creating VM ${vmid} (${hostname})..."
-  local ram_mb=$(( ram_gb * 1024 ))
-
-  qm create "$vmid" --name "$hostname" --memory "$ram_mb" --cores "$cores" \
-    --cpu cputype=host --ostype l26 --agent enabled=1 --serial0 socket --vga serial0
-
-  local img_copy="/tmp/ridestatus-vm${vmid}.img"
-  cp "$UBUNTU_IMG_PATH" "$img_copy"
-  qm importdisk "$vmid" "$img_copy" "$DISK_STORAGE" --format qcow2
-  rm -f "$img_copy"
-
-  qm set "$vmid" --scsihw virtio-scsi-pci \
-    --scsi0 "${DISK_STORAGE}:vm-${vmid}-disk-0,discard=on" --boot order=scsi0
-  qm resize "$vmid" scsi0 "${disk_gb}G"
-
-  local br_idx=0 usb_slot=0
-  for i in "${!cv_type[@]}"; do
-    if [[ "${cv_type[$i]}" == "bridge" ]]; then
-      qm set "$vmid" --net${br_idx} "virtio,bridge=${cv_bridge[$i]}"
-      br_idx=$(( br_idx+1 ))
-    else
-      local bp="${USB_NIC_BUS[${cv_usb[$i]}]:-}"
-      if [[ -n "$bp" ]]; then
-        qm set "$vmid" --usb${usb_slot} "host=${bp}"
-      else
-        qm set "$vmid" --usb${usb_slot} "host=${USB_NIC_VP[${cv_usb[$i]}]}"
-      fi
-      usb_slot=$(( usb_slot+1 ))
-    fi
-  done
-
-  qm set "$vmid" --ide2 "${CI_STORAGE}:cloudinit"
-
-  local ipcfg_idx=0
-  for i in "${!cv_type[@]}"; do
-    [[ "${cv_type[$i]}" != "bridge" ]] && continue
-    local gw_part=""
-    [[ -n "${cv_gw[$i]:-}" ]] && gw_part=",gw=${cv_gw[$i]}"
-    qm set "$vmid" --ipconfig${ipcfg_idx} "ip=${cv_ip[$i]}${gw_part}"
-    ipcfg_idx=$(( ipcfg_idx+1 ))
-  done
-
-  qm set "$vmid" --nameserver "${cv_dns[0]:-8.8.8.8}" --ciupgrade 0
-
-  local snip
-  snip=$(write_snippet "$vmid" "$DEPLOY_PUBKEY_CONTENT" "$ADMIN_SSH_PUBKEY")
-  qm set "$vmid" --cicustom "user=${CI_STORAGE}:snippets/$(basename "$snip")"
-  qm cloudinit update "$vmid"
-  ok "VM ${vmid} configured"
-}
-
-fix_usb_nic_names() {
-  local vmid=$1
-  local -n fnn_type=$2 fnn_usb=$3 fnn_ip=$4
-
-  local has_usb=false
-  for t in "${fnn_type[@]}"; do [[ "$t" == "usb" ]] && has_usb=true && break; done
-  $has_usb || return 0
-
-  info "Querying guest agent for NIC names in VM ${vmid}..."
-  local ga_json
-  ga_json=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null || true)
-  [[ -z "$ga_json" ]] && { warn "No NIC data from guest agent"; return 0; }
-
-  declare -A ga_map=()
-  while IFS= read -r line; do
-    local n m
-    n=$(echo "$line" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('name',''))" 2>/dev/null || true)
-    m=$(echo "$line" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('hardware-address','').lower())" 2>/dev/null || true)
-    [[ -n "$n" && -n "$m" ]] && ga_map["$m"]="$n"
-  done < <(echo "$ga_json" | python3 -c \
-    "import sys,json;[print(json.dumps(x)) for x in json.load(sys.stdin).get('result',[])]" 2>/dev/null || true)
-
-  [[ ${#ga_map[@]} -eq 0 ]] && { warn "Guest agent returned no NIC data"; return 0; }
-
-  local usb_slot=0
-  declare -A real_names=()
-  local needs_fix=false
-  for i in "${!fnn_type[@]}"; do
-    [[ "${fnn_type[$i]}" != "usb" ]] && continue
-    local hm; hm=$(iface_mac "${fnn_usb[$i]}" | tr '[:upper:]' '[:lower:]')
-    local rn="${ga_map[$hm]:-}" ph="usb-placeholder-${usb_slot}"
-    if [[ -n "$rn" && "$rn" != "$ph" ]]; then real_names["$ph"]="$rn"; needs_fix=true; fi
-    usb_slot=$(( usb_slot+1 ))
-  done
-
-  $needs_fix || { ok "NIC names correct"; return 0; }
-
-  local ssh_ip=""
-  for i in "${!fnn_type[@]}"; do
-    [[ "${fnn_type[$i]}" == "bridge" ]] && { ssh_ip="${fnn_ip[$i]%%/*}"; break; }
-  done
-  [[ -z "$ssh_ip" ]] && ssh_ip="${fnn_ip[0]%%/*}"
-
-  local sed_args=()
-  for ph in "${!real_names[@]}"; do sed_args+=(-e "s/${ph}/${real_names[$ph]}/g"); done
-
-  deploy_ssh "$ssh_ip" "
-    set -e
-    f=\$(ls /etc/netplan/*.yaml 2>/dev/null | head -1)
-    [[ -z \"\$f\" ]] && exit 1
-    sudo sed -i ${sed_args[*]} \"\$f\"
-    sudo netplan apply
-  " && ok "Netplan patched" || warn "Netplan patch failed — check USB NIC names manually"
-}
 
 # =============================================================================
-# Bootstrap runner
-# Writes env file locally then SCPs it — avoids SSH key timing/quoting issues.
+# Create VM
 # =============================================================================
-run_bootstrap() {
-  local ip=$1 script=$2 env_vars=${3:-}
-  info "Running ${script} on ${ip}..."
+header "Creating VM ${VMID}"
+RAM_MB=$(( VM_RAM * 1024 ))
 
-  local remote_script="/tmp/ridestatus-bs-$$.sh"
-  local remote_env="/tmp/ridestatus-env-$$.sh"
-  local local_script local_env
-  local_script=$(mktemp /tmp/ridestatus-local-script-XXXXXX.sh)
-  local_env=$(mktemp /tmp/ridestatus-local-env-XXXXXX.sh)
+qm create "$VMID" --name "$VM_HOST" --memory "$RAM_MB" --cores "$VM_CORES" \
+  --cpu cputype=host --ostype l26 --agent enabled=1 --serial0 socket --vga serial0
 
-  # Download bootstrap script locally first
-  curl -fsSL -H "Cache-Control: no-cache" \
-    "${BOOTSTRAP_BASE_URL}/${script}?$(date +%s)" -o "$local_script" \
-    || { err "Failed to download ${script}"; rm -f "$local_script" "$local_env"; return 1; }
+IMG_COPY="${_WORK_DIR}/vm${VMID}.img"
+cp "$UBUNTU_IMG_PATH" "$IMG_COPY"
+qm importdisk "$VMID" "$IMG_COPY" "$DISK_STORAGE" --format qcow2
+rm -f "$IMG_COPY"
 
-  # Write env file locally (no quoting issues at all)
-  if [[ -n "$env_vars" ]]; then
-    printf '%s\n' "$env_vars" | sed 's/^/export /' > "$local_env"
-  fi
+qm set "$VMID" --scsihw virtio-scsi-pci \
+  --scsi0 "${DISK_STORAGE}:vm-${VMID}-disk-0,discard=on" --boot order=scsi0
+qm resize "$VMID" scsi0 "${VM_DISK}G"
 
-  # SCP both files to the VM using available key
-  local scp_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes"
-  local scp_ok=false
-  for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
-    [[ -f "$key" ]] || continue
-    # shellcheck disable=SC2086
-    if scp $scp_opts -i "$key" "$local_script" "ridestatus@${ip}:${remote_script}" 2>/dev/null; then
-      if [[ -n "$env_vars" ]]; then
-        # shellcheck disable=SC2086
-        scp $scp_opts -i "$key" "$local_env" "ridestatus@${ip}:${remote_env}" 2>/dev/null || true
-      fi
-      scp_ok=true
-      break
-    fi
-  done
-  rm -f "$local_script" "$local_env"
-
-  if ! $scp_ok; then
-    err "Failed to SCP files to ${ip}"
-    return 1
-  fi
-
-  # Execute with TTY
-  if [[ -n "$env_vars" ]]; then
-    deploy_ssh -t "$ip" sudo bash -c \
-      ". '${remote_env}' && bash '${remote_script}'; rm -f '${remote_script}' '${remote_env}'"
+# NICs
+br_idx=0; usb_slot=0
+for i in "${!VM_NIC_TYPES[@]}"; do
+  if [[ "${VM_NIC_TYPES[$i]}" == "bridge" ]]; then
+    qm set "$VMID" --net${br_idx} "virtio,bridge=${VM_NIC_BRIDGES[$i]}"
+    br_idx=$(( br_idx+1 ))
   else
-    deploy_ssh -t "$ip" sudo bash "${remote_script}"
+    bp="${USB_NIC_BUS[${VM_NIC_USBS[$i]}]:-}"
+    if [[ -n "$bp" ]]; then
+      qm set "$VMID" --usb${usb_slot} "host=${bp}"
+    else
+      qm set "$VMID" --usb${usb_slot} "host=${USB_NIC_VP[${VM_NIC_USBS[$i]}]}"
+    fi
+    usb_slot=$(( usb_slot+1 ))
   fi
-  local rc=$?
+done
 
-  deploy_ssh "$ip" "rm -f '${remote_script}' '${remote_env}'" 2>/dev/null || true
+# Cloud-init IP config
+qm set "$VMID" --ide2 "${CI_STORAGE}:cloudinit"
+ipcfg_idx=0
+for i in "${!VM_NIC_TYPES[@]}"; do
+  [[ "${VM_NIC_TYPES[$i]}" != "bridge" ]] && continue
+  gw_part=""
+  [[ -n "${VM_NIC_GWS[$i]:-}" ]] && gw_part=",gw=${VM_NIC_GWS[$i]}"
+  qm set "$VMID" --ipconfig${ipcfg_idx} "ip=${VM_NIC_IPS[$i]}${gw_part}"
+  ipcfg_idx=$(( ipcfg_idx+1 ))
+done
 
-  if [[ $rc -ne 0 ]]; then
-    err "Bootstrap failed for ${script} on ${ip} (exit ${rc})"
-    err "Retry: ssh -i ${ADMIN_KEY_PATH} ridestatus@${ip}"
-    return 1
-  fi
-  ok "${script} completed on ${ip}"
-}
+qm set "$VMID" --nameserver "8.8.8.8" --ciupgrade 0
+qm set "$VMID" --cicustom "user=${CI_STORAGE}:snippets/$(basename "$SNIPPET_FILE")"
+qm cloudinit update "$VMID"
+ok "VM ${VMID} configured"
 
-# =============================================================================
-# Build env strings for bootstrap scripts
-# =============================================================================
-_build_ansible_env() {
-  local extra="${1:-}"
-  local env="RS_GITHUB_AUTH=${GITHUB_AUTH_METHOD}"
-  if [[ "$GITHUB_AUTH_METHOD" == "pat" ]]; then
-    env+=$'\n'"RS_GITHUB_USER=${GITHUB_USER}"
-    env+=$'\n'"RS_GITHUB_PAT=${GITHUB_PAT}"
-  fi
-  [[ -n "$extra" ]] && env+=$'\n'"${extra}"
-  echo "$env"
-}
-
-_build_server_env() {
-  local extra="${1:-}"
-  local api_key bootstrap_token
-  api_key=$(python3 -c "import secrets; print(secrets.token_hex(32))")
-  bootstrap_token=$(python3 -c "import secrets,string; \
-    print(''.join(secrets.choice(string.ascii_uppercase+string.digits) for _ in range(8)))")
-
-  local dr_iface="ens18"
-  [[ $SERVER_DR_IDX -ge 0 ]] && dr_iface="net${SERVER_DR_IDX}"
-
-  local env="RS_GITHUB_AUTH=${GITHUB_AUTH_METHOD}"
-  if [[ "$GITHUB_AUTH_METHOD" == "pat" ]]; then
-    env+=$'\n'"RS_GITHUB_USER=${GITHUB_USER}"
-    env+=$'\n'"RS_GITHUB_PAT=${GITHUB_PAT}"
-  fi
-  env+=$'\n'"RS_PARK_NAME=${PARK_NAME}"
-  env+=$'\n'"RS_PARK_TZ=${PARK_TZ}"
-  env+=$'\n'"RS_API_KEY=${api_key}"
-  env+=$'\n'"RS_BOOTSTRAP_TOKEN=${bootstrap_token}"
-  env+=$'\n'"RS_WEATHER_API_KEY=${WEATHER_API_KEY}"
-  env+=$'\n'"RS_WEATHER_ZIP=${WEATHER_ZIP}"
-  env+=$'\n'"RS_ALERT_EMAIL=${ALERT_EMAIL}"
-  env+=$'\n'"RS_ALERT_SMS=${ALERT_SMS}"
-  env+=$'\n'"RS_SMTP_HOST=${SMTP_HOST}"
-  env+=$'\n'"RS_SMTP_PORT=${SMTP_PORT}"
-  env+=$'\n'"RS_SMTP_USER=${SMTP_USER}"
-  env+=$'\n'"RS_SMTP_PASS=${SMTP_PASS}"
-  env+=$'\n'"RS_DEFAULT_ROUTE_IFACE=${dr_iface}"
-  [[ -n "$extra" ]] && env+=$'\n'"${extra}"
-  echo "$env"
-}
+qm start "$VMID"
+purge_known_host "$VM_IP"
+ok "VM ${VMID} started"
 
 # =============================================================================
-# Create VMs
+# Wait for VM
 # =============================================================================
-header "Creating VMs"
-ensure_ubuntu_image
-
-if $CREATE_ANSIBLE; then
-  header "Creating Ansible Controller VM (${ANSIBLE_VMID})"
-  create_vm "$ANSIBLE_VMID" "$ANSIBLE_HOST" "$ANSIBLE_RAM" "$ANSIBLE_CORES" "$ANSIBLE_DISK" \
-    A_NIC_TYPES A_NIC_BRIDGES A_NIC_USBS A_NIC_IPS A_NIC_GWS A_NIC_DNSS
-  qm start "$ANSIBLE_VMID"
-  purge_known_host "$(first_ip A_NIC_IPS)"
-  ok "VM ${ANSIBLE_VMID} started"
-fi
-
-if $CREATE_SERVER; then
-  header "Creating RideStatus Server VM (${SERVER_VMID})"
-  create_vm "$SERVER_VMID" "$SERVER_HOST" "$SERVER_RAM" "$SERVER_CORES" "$SERVER_DISK" \
-    S_NIC_TYPES S_NIC_BRIDGES S_NIC_USBS S_NIC_IPS S_NIC_GWS S_NIC_DNSS
-  qm start "$SERVER_VMID"
-  purge_known_host "$(first_ip S_NIC_IPS)"
-  ok "VM ${SERVER_VMID} started"
-fi
-
-ANSIBLE_IP="" SERVER_IP=""
-
-if $CREATE_ANSIBLE; then
-  wait_for_agent "$ANSIBLE_VMID"
-  fix_usb_nic_names "$ANSIBLE_VMID" A_NIC_TYPES A_NIC_USBS A_NIC_IPS
-  ANSIBLE_IP=$(first_ip A_NIC_IPS)
-  wait_for_ssh "$ANSIBLE_IP"
-fi
-
-if $CREATE_SERVER; then
-  wait_for_agent "$SERVER_VMID"
-  fix_usb_nic_names "$SERVER_VMID" S_NIC_TYPES S_NIC_USBS S_NIC_IPS
-  SERVER_IP=$(first_ip S_NIC_IPS)
-  wait_for_ssh "$SERVER_IP"
-fi
+wait_agent "$VMID"
+wait_ssh "$VM_IP"
 
 # =============================================================================
-# Bootstrap
+# Install Docker
 # =============================================================================
-if $CREATE_ANSIBLE && $CREATE_SERVER; then
-  ansible_key_url="http://${ANSIBLE_IP}:${ANSIBLE_KEY_SERVER_PORT}/ansible_ridestatus.pub"
-  server_env=""
-  server_env=$(_build_server_env \
-    "RS_ANSIBLE_KEY_URL=${ansible_key_url}"$'\n'"RS_ANSIBLE_VM_HOST=${ANSIBLE_IP}")
-  ansible_env=""
-  ansible_env=$(_build_ansible_env)
+header "Installing Docker"
+rssh_tty "$VM_IP" "bash -s" <<'DOCKER_INSTALL'
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y --no-install-recommends ca-certificates curl gnupg
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  > /etc/apt/sources.list.d/docker.list
+apt-get update -qq
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+usermod -aG docker ridestatus
+systemctl enable docker
+echo "Docker installed"
+DOCKER_INSTALL
+ok "Docker installed"
 
-  info "Starting server.sh in background..."
-  ( run_bootstrap "$SERVER_IP" "server.sh" "$server_env" || true ) &
-  SERVER_BS_PID=$!
-  run_bootstrap "$ANSIBLE_IP" "ansible.sh" "$ansible_env" || true
-  info "Waiting for server.sh..."
-  wait "$SERVER_BS_PID" 2>/dev/null || true
+# =============================================================================
+# Write .env file locally then SCP it
+# =============================================================================
+header "Deploying ${VM_ROLE}"
 
-elif $CREATE_ANSIBLE; then
-  run_bootstrap "$ANSIBLE_IP" "ansible.sh" "$(_build_ansible_env)" || true
+ENV_FILE="${_WORK_DIR}/.env"
+case "$VM_ROLE" in
+  manage)
+    cat > "$ENV_FILE" <<ENV
+NODE_ENV=production
+PORT=3000
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+POSTGRES_DB=ridestatus_manage
+POSTGRES_USER=ridestatus
+POSTGRES_PASSWORD=$(python3 -c "import secrets; print(secrets.token_hex(16))")
+GITHUB_TOKEN=${GITHUB_TOKEN}
+ENV
+    ;;
+  server)
+    cat > "$ENV_FILE" <<ENV
+NODE_ENV=production
+PORT=3000
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+POSTGRES_DB=ridestatus
+POSTGRES_USER=ridestatus
+POSTGRES_PASSWORD=$(python3 -c "import secrets; print(secrets.token_hex(16))")
+API_KEY=${API_KEY}
+BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN}
+PARK_NAME=${PARK_NAME}
+PARK_TZ=${PARK_TZ}
+WEATHER_API_KEY=${WEATHER_API_KEY}
+WEATHER_ZIP=${WEATHER_ZIP}
+ALERT_EMAIL=${ALERT_EMAIL}
+SMTP_HOST=${SMTP_HOST}
+SMTP_PORT=${SMTP_PORT}
+SMTP_USER=${SMTP_USER}
+SMTP_PASS=${SMTP_PASS}
+ENV
+    ;;
+  edge)
+    cat > "$ENV_FILE" <<ENV
+NODE_ENV=production
+GITHUB_TOKEN=${GITHUB_TOKEN}
+ENV
+    ;;
+esac
 
-elif $CREATE_SERVER; then
-  run_bootstrap "$SERVER_IP" "server.sh" "$(_build_server_env)" || true
-fi
+# Download docker-compose.yml for this role
+COMPOSE_FILE="${_WORK_DIR}/docker-compose.yml"
+curl -fsSL "${COMPOSE_BASE_URL}/${VM_ROLE}/docker-compose.yml" -o "$COMPOSE_FILE" \
+  || die "Failed to download docker-compose.yml for ${VM_ROLE}"
+
+# SCP both files to VM
+rssh "$VM_IP" "mkdir -p /opt/ridestatus"
+rscp "$ENV_FILE"     "$VM_IP" "/opt/ridestatus/.env"
+rscp "$COMPOSE_FILE" "$VM_IP" "/opt/ridestatus/docker-compose.yml"
+rssh "$VM_IP" "chown -R ridestatus:ridestatus /opt/ridestatus"
+ok "Files deployed"
+
+# =============================================================================
+# Start services
+# =============================================================================
+header "Starting Services"
+rssh_tty "$VM_IP" \
+  "cd /opt/ridestatus && sudo docker compose pull && sudo docker compose up -d"
+ok "Services started"
 
 # =============================================================================
 # Done
 # =============================================================================
 header "Deployment Complete"
-$CREATE_ANSIBLE && ok "Ansible Controller VM ${ANSIBLE_VMID} (${ANSIBLE_HOST}) — ${ANSIBLE_IP}"
-$CREATE_SERVER  && ok "RideStatus Server VM ${SERVER_VMID} (${SERVER_HOST}) — ${SERVER_IP}"
+ok "VM ${VMID} (${VM_HOST}) — ${VM_IP}"
+echo ""
+rssh "$VM_IP" "docker compose -f /opt/ridestatus/docker-compose.yml ps" 2>/dev/null || true
+echo ""
 
 if $ADMIN_GENERATED; then
-  echo ""
-  warn "*** IMPORTANT: Copy admin SSH private key off this Proxmox host ***"
+  warn "*** Copy admin SSH key off this Proxmox host ***"
   warn "    ${ADMIN_KEY_PATH}"
+fi
+
+if [[ "$VM_ROLE" == "server" ]]; then
+  ok "Park board: http://${VM_IP}:3000"
+  ok "Bootstrap token: ${BOOTSTRAP_TOKEN}"
+  ok "API key: ${API_KEY}"
+  warn "Save the bootstrap token and API key — you will need them for edge nodes"
+fi
+
+if [[ "$VM_ROLE" == "manage" ]]; then
+  ok "Management UI: http://${VM_IP}:3000"
 fi
 echo ""
