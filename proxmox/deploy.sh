@@ -49,6 +49,7 @@ UBUNTU_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloud
 UBUNTU_IMG_PATH="/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img"
 SNIPPET_DIR="/var/lib/vz/snippets"
 COMPOSE_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/compose"
+SELF_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-manage/main/backend/scripts/self-update.sh"
 
 # =============================================================================
 # Temp file for dialog output — avoids $() subshell losing the TTY
@@ -219,7 +220,6 @@ DEPLOY_PUBKEY_CONTENT=$(cat "${DEPLOY_KEY}.pub")
 _ssh_base_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes"
 
 rssh() {
-  # rssh [opts] ip command...
   local ip=$1; shift
   for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
     [[ -f "$key" ]] || continue
@@ -242,7 +242,6 @@ rssh_tty() {
 }
 
 rscp() {
-  # rscp local_file ip:remote_path
   local local_file=$1 ip=$2 remote_path=$3
   for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
     [[ -f "$key" ]] || continue
@@ -289,7 +288,6 @@ collect_nics() {
   local dr_assigned=false nic_num=1
 
   while true; do
-    # Connection type
     local nic_type=""
     local available_usb=()
     for u in "${FREE_USB_NICS[@]:-}"; do
@@ -344,7 +342,6 @@ collect_nics() {
       _session_claimed+=("$usb_iface")
     fi
 
-    # IP
     local ip_cidr=""
     while true; do
       wt_input ip_cidr "${vm_label} vNIC${nic_num} — Static IP/prefix (e.g. 10.250.5.101/19):" ""
@@ -352,7 +349,6 @@ collect_nics() {
       wt_msg "Invalid format. Example: 10.250.5.101/19"
     done
 
-    # Default route
     local gw="" is_dr="no"
     if ! $dr_assigned; then
       if wt_yesno "Use vNIC${nic_num} (${ip_cidr}) as the default route?\n\nThis NIC carries internet traffic."; then
@@ -654,6 +650,63 @@ rssh_tty "$VM_IP" \
 ok "Services started"
 
 # =============================================================================
+# Automatic updates (manage role only)
+# Self-update script + cron every 30 min + unattended-upgrades for OS patches
+# =============================================================================
+if [[ "$VM_ROLE" == "manage" ]]; then
+  header "Configuring Automatic Updates"
+
+  # Download self-update script and SCP to VM
+  SELF_UPDATE_LOCAL="${_WORK_DIR}/self-update.sh"
+  curl -fsSL "$SELF_UPDATE_SCRIPT_URL" -o "$SELF_UPDATE_LOCAL" \
+    || die "Failed to download self-update.sh"
+  rscp "$SELF_UPDATE_LOCAL" "$VM_IP" "/tmp/self-update.sh"
+
+  rssh_tty "$VM_IP" "bash -s" <<'AUTO_UPDATE'
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+# Install self-update script
+sudo install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
+sudo chown root:root /opt/ridestatus/self-update.sh
+
+# Create log file
+sudo touch /var/log/ridestatus-self-update.log
+sudo chmod 644 /var/log/ridestatus-self-update.log
+
+# Cron job: run self-update every 30 minutes
+echo "*/30 * * * * root /opt/ridestatus/self-update.sh >> /var/log/ridestatus-self-update.log 2>&1" \
+  | sudo tee /etc/cron.d/ridestatus-manage-update > /dev/null
+sudo chmod 644 /etc/cron.d/ridestatus-manage-update
+
+# Install unattended-upgrades for automatic OS security patches
+apt-get install -y --no-install-recommends unattended-upgrades update-notifier-common
+
+# Configure unattended-upgrades: security patches only, auto-clean, no auto-reboot
+sudo tee /etc/apt/apt.conf.d/50unattended-upgrades > /dev/null <<'CONF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+CONF
+
+# Enable daily auto-upgrade
+sudo tee /etc/apt/apt.conf.d/20auto-upgrades > /dev/null <<'CONF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+CONF
+
+sudo systemctl enable --now unattended-upgrades
+echo "Automatic updates configured"
+AUTO_UPDATE
+  ok "Self-update cron installed (every 30 min)"
+  ok "unattended-upgrades enabled (security patches, no auto-reboot)"
+fi
+
+# =============================================================================
 # Done
 # =============================================================================
 header "Deployment Complete"
@@ -676,5 +729,7 @@ fi
 
 if [[ "$VM_ROLE" == "manage" ]]; then
   ok "Management UI: http://${VM_IP}:3000"
+  ok "Default login: admin / admin  (change immediately)"
+  ok "Self-update: runs every 30 min via cron, or use the Dashboard button"
 fi
 echo ""
