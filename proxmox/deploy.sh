@@ -7,12 +7,12 @@
 # Creates RideStatus Server VM and/or Ansible Controller VM.
 #
 # Flow:
-#   1. whiptail TUI collects ALL configuration up front.
+#   1. dialog TUI collects ALL configuration up front.
 #   2. VMs are created and bootstrap scripts run non-interactively via env vars.
 #   3. The only remaining interactive step is the GitHub deploy key
 #      "Press Enter" — which works reliably since it runs with a direct TTY.
 #
-# Usage: bash /tmp/deploy.sh   (download first, then run — whiptail needs TTY)
+# Usage: bash /tmp/deploy.sh   (download first, then run — dialog needs TTY)
 # =============================================================================
 
 set -euo pipefail
@@ -34,7 +34,7 @@ header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
 command -v pvesh     >/dev/null 2>&1 || die "pvesh not found — is this a Proxmox host?"
 command -v pvesm     >/dev/null 2>&1 || die "pvesm not found — is this a Proxmox host?"
 command -v qm        >/dev/null 2>&1 || die "qm not found — is this a Proxmox host?"
-command -v whiptail  >/dev/null 2>&1 || die "whiptail not found (apt install whiptail)"
+command -v dialog    >/dev/null 2>&1 || die "dialog not found (apt install dialog)"
 command -v ssh       >/dev/null 2>&1 || die "ssh not found"
 command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen not found"
 command -v python3   >/dev/null 2>&1 || die "python3 not found"
@@ -182,28 +182,28 @@ cleanup() {
 trap cleanup EXIT
 
 # =============================================================================
-# whiptail helpers
+# dialog helpers
 # =============================================================================
 WT_H=20; WT_W=72
 
-wt_msg()  { whiptail --title "RideStatus Deploy" --msgbox      "$1" $WT_H $WT_W; }
+wt_msg()  { dialog --title "RideStatus Deploy" --msgbox      "$1" $WT_H $WT_W; }
 wt_input() {
   # wt_input VARNAME "prompt" "default"
   local -n _wi=$1
-  _wi=$(whiptail --title "RideStatus Deploy" --inputbox "$2" 10 $WT_W "$3" 3>&1 1>&2 2>&3) || true
+  _wi=$(dialog --title "RideStatus Deploy" --inputbox "$2" 10 $WT_W "$3" 3>&1 1>&2 2>&3) || true
   [[ -z "$_wi" && -n "${3:-}" ]] && _wi="$3"
 }
 wt_password() {
   local -n _wp=$1
-  _wp=$(whiptail --title "RideStatus Deploy" --passwordbox "$2" 10 $WT_W 3>&1 1>&2 2>&3) || true
+  _wp=$(dialog --title "RideStatus Deploy" --passwordbox "$2" 10 $WT_W 3>&1 1>&2 2>&3) || true
 }
 wt_menu() {
   # wt_menu VARNAME "prompt" item1 desc1 item2 desc2 ...
   local -n _wm=$1; local prompt=$2; shift 2
-  _wm=$(whiptail --title "RideStatus Deploy" --menu "$prompt" $WT_H $WT_W 8 "$@" 3>&1 1>&2 2>&3) || true
+  _wm=$(dialog --title "RideStatus Deploy" --menu "$prompt" $WT_H $WT_W 8 "$@" 3>&1 1>&2 2>&3) || true
 }
 wt_yesno() {
-  whiptail --title "RideStatus Deploy" --yesno "$1" 10 $WT_W
+  dialog --title "RideStatus Deploy" --yesno "$1" 10 $WT_W
 }
 
 # =============================================================================
