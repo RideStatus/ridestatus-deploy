@@ -422,9 +422,12 @@ VM_IP="${VM_NIC_IPS[0]%%/*}"
 # Role-specific config
 # =============================================================================
 PARK_NAME="" PARK_TZ="" API_KEY="" BOOTSTRAP_TOKEN=""
-WEATHER_API_KEY="" WEATHER_ZIP="" ALERT_EMAIL="" ALERT_SMS=""
+WEATHER_API_KEY="" WEATHER_ZIP="" ALERT_EMAIL=""
 SMTP_HOST="" SMTP_PORT="587" SMTP_USER="" SMTP_PASS=""
 GITHUB_TOKEN=""
+PROXMOX_API_HOST="" PROXMOX_API_PORT="8006"
+PROXMOX_API_USER="" PROXMOX_API_PASS="" PROXMOX_API_NODE=""
+SERVER_URL="" SERVER_API_KEY_VAL=""
 
 if [[ "$VM_ROLE" == "server" ]]; then
   wt_input PARK_NAME       "Park name:"                       "My Park"
@@ -443,8 +446,19 @@ if [[ "$VM_ROLE" == "server" ]]; then
     print(''.join(secrets.choice(string.ascii_uppercase+'0123456789') for _ in range(8)))")
 fi
 
+if [[ "$VM_ROLE" == "manage" ]]; then
+  wt_msg "Proxmox API credentials\n\nThe management plane uses the Proxmox API to provision new VMs.\nEnter the credentials for this Proxmox host."
+  wt_input    PROXMOX_API_HOST "Proxmox API host (IP of this host):" "$(hostname -I | awk '{print $1}')"
+  wt_input    PROXMOX_API_PORT "Proxmox API port:"                   "8006"
+  wt_input    PROXMOX_API_USER "Proxmox API user (e.g. root@pam):"   "root@pam"
+  wt_password PROXMOX_API_PASS "Proxmox API password:"
+  wt_input    PROXMOX_API_NODE "Proxmox node name:"                  "${PROXMOX_NODE}"
+  wt_input    SERVER_URL       "Park board server URL (or blank):"   "http://10.250.5.102:3000"
+  wt_input    SERVER_API_KEY_VAL "Park board API key (or blank):"    ""
+fi
+
 if [[ "$VM_ROLE" == "manage" || "$VM_ROLE" == "edge" ]]; then
-  wt_password GITHUB_TOKEN "GitHub token (for pulling private images, or blank):"
+  wt_password GITHUB_TOKEN "GitHub token (for pulling ghcr.io images):"
 fi
 
 # =============================================================================
@@ -581,6 +595,18 @@ DOCKER_INSTALL
 ok "Docker installed"
 
 # =============================================================================
+# Login to ghcr.io if GitHub token provided
+# =============================================================================
+if [[ -n "$GITHUB_TOKEN" ]]; then
+  header "Logging into ghcr.io"
+  # Login on the Proxmox host (for any local docker operations)
+  echo "$GITHUB_TOKEN" | docker login ghcr.io -u ridestatus --password-stdin 2>/dev/null || true
+  # Login on the VM so docker compose pull can succeed
+  rssh "$VM_IP" "echo '${GITHUB_TOKEN}' | sudo docker login ghcr.io -u ridestatus --password-stdin"
+  ok "Logged into ghcr.io"
+fi
+
+# =============================================================================
 # Write .env file locally then SCP it
 # =============================================================================
 header "Deploying ${VM_ROLE}"
@@ -588,18 +614,30 @@ header "Deploying ${VM_ROLE}"
 ENV_FILE="${_WORK_DIR}/.env"
 case "$VM_ROLE" in
   manage)
+    SESSION_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+    PG_PASS=$(python3 -c "import secrets; print(secrets.token_hex(16))")
     cat > "$ENV_FILE" <<ENV
 NODE_ENV=production
 PORT=3000
+SESSION_SECRET=${SESSION_SECRET}
 POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 POSTGRES_DB=ridestatus_manage
 POSTGRES_USER=ridestatus
-POSTGRES_PASSWORD=$(python3 -c "import secrets; print(secrets.token_hex(16))")
+POSTGRES_PASSWORD=${PG_PASS}
+PROXMOX_HOST=${PROXMOX_API_HOST}
+PROXMOX_PORT=${PROXMOX_API_PORT}
+PROXMOX_USER=${PROXMOX_API_USER}
+PROXMOX_PASSWORD=${PROXMOX_API_PASS}
+PROXMOX_NODE=${PROXMOX_API_NODE}
+MANAGE_SSH_KEY_PATH=/home/ridestatus/.ssh/ansible_ridestatus
+SERVER_URL=${SERVER_URL}
+SERVER_API_KEY=${SERVER_API_KEY_VAL}
 GITHUB_TOKEN=${GITHUB_TOKEN}
 ENV
     ;;
   server)
+    PG_PASS=$(python3 -c "import secrets; print(secrets.token_hex(16))")
     cat > "$ENV_FILE" <<ENV
 NODE_ENV=production
 PORT=3000
@@ -607,7 +645,7 @@ POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 POSTGRES_DB=ridestatus
 POSTGRES_USER=ridestatus
-POSTGRES_PASSWORD=$(python3 -c "import secrets; print(secrets.token_hex(16))")
+POSTGRES_PASSWORD=${PG_PASS}
 API_KEY=${API_KEY}
 BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN}
 PARK_NAME=${PARK_NAME}
