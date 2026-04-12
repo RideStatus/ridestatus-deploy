@@ -30,17 +30,6 @@
 #   After each VM boots, the QEMU guest agent is queried for real NIC names.
 #   Any USB passthrough NIC netplan placeholders are patched in-place.
 #
-# Bootstrap execution order:
-#   1. Both VMs are created and started simultaneously.
-#   2. ansible.sh runs to completion (foreground, with TTY for interactive
-#      prompts). ansible.sh ends by starting its key server and blocking.
-#      NOTE: When both VMs are on the same host, ansible.sh blocks waiting
-#      for server.sh to fetch the key, so server.sh runs in a background
-#      subshell. When only the Ansible VM is on this host, ansible.sh runs
-#      fully in the foreground.
-#   3. server.sh runs after ansible.sh has started its key server (single-
-#      host) or is prompted for the URL manually (two-host).
-#
 # Bootstrap script delivery:
 #   Bootstrap scripts are downloaded to a temp file on the remote VM before
 #   execution. This keeps stdin free for interactive prompts (/dev/tty reads)
@@ -316,7 +305,8 @@ trap cleanup EXIT
 # interactive prompts. Double -t forces TTY allocation even when deploy.sh
 # itself has no TTY (e.g. when run via bash <(curl ...)).
 #
-# BatchMode is disabled in TTY mode so interactive prompts can function.
+# In TTY mode stderr is NOT suppressed so interactive output and error
+# messages reach the terminal.
 deploy_ssh() {
   local tty_flag=false
   if [[ "${1:-}" == "-t" ]]; then
@@ -332,23 +322,27 @@ deploy_ssh() {
   if $tty_flag; then
     # -t -t: force TTY even when local stdin is not a TTY (bash <(curl ...))
     ssh_opts+=(-t -t)
+    # Do NOT suppress stderr in TTY mode — interactive output must reach terminal
+    ssh -i "$DEPLOY_KEY" "${ssh_opts[@]}" "ridestatus@${ip}" "$@"
+    local exit_code=$?
+    if [[ $exit_code -eq 255 ]] && [[ -f "$ADMIN_KEY_PATH" ]]; then
+      ssh -i "$ADMIN_KEY_PATH" "${ssh_opts[@]}" "ridestatus@${ip}" "$@"
+      return $?
+    fi
+    return $exit_code
   else
     ssh_opts+=(-o BatchMode=yes)
+    local exit_code=0
+    ssh -i "$DEPLOY_KEY" "${ssh_opts[@]}" "ridestatus@${ip}" "$@" 2>/dev/null
+    exit_code=$?
+    if [[ $exit_code -eq 0 ]]; then return 0; fi
+    if [[ $exit_code -ne 255 ]]; then return $exit_code; fi
+    if [[ -f "$ADMIN_KEY_PATH" ]]; then
+      ssh -i "$ADMIN_KEY_PATH" "${ssh_opts[@]}" "ridestatus@${ip}" "$@" 2>/dev/null
+      return $?
+    fi
+    return 1
   fi
-  local exit_code=0
-  ssh -i "$DEPLOY_KEY" "${ssh_opts[@]}" "ridestatus@${ip}" "$@" 2>/dev/null
-  exit_code=$?
-  if [[ $exit_code -eq 0 ]]; then
-    return 0
-  fi
-  if [[ $exit_code -ne 255 ]]; then
-    return $exit_code
-  fi
-  if [[ -f "$ADMIN_KEY_PATH" ]]; then
-    ssh -i "$ADMIN_KEY_PATH" "${ssh_opts[@]}" "ridestatus@${ip}" "$@"
-    return $?
-  fi
-  return 1
 }
 
 # =============================================================================
@@ -513,16 +507,13 @@ declare -A BRIDGE_IFACE_MAP=()
 # =============================================================================
 # NIC configuration helper
 # =============================================================================
-# DEFAULT_ROUTE_NIC_IDX tracks which vNIC index was set as the default route.
-# Passed to server.sh as RS_DEFAULT_ROUTE_NIC_HINT so it can pre-populate
-# the DEFAULT_ROUTE_INTERFACE in .env for outbound services.
 DEFAULT_ROUTE_NIC_IDX=-1
 
 configure_vm_nics() {
   local vm_label=$1
   VM_NICS_TYPE=(); VM_NICS_LABEL=(); VM_NICS_BRIDGE=()
   VM_NICS_USB=();  VM_NICS_MAC=();   VM_NICS_IP=(); VM_NICS_GW=(); VM_NICS_DNS=()
-  VM_NICS_DEFAULT_ROUTE=()   # "yes" or "no"
+  VM_NICS_DEFAULT_ROUTE=()
   DEFAULT_ROUTE_NIC_IDX=-1
   local default_route_assigned=false
 
@@ -531,12 +522,10 @@ configure_vm_nics() {
     echo ""
     echo -e "${BOLD}--- ${vm_label}: vNIC${nic_num} ---${RESET}"
 
-    # --- Network label ---
     echo ""
     local net_label
     prompt_required net_label "Network label for vNIC${nic_num} (e.g. Ride Network, Office Network, Management)"
 
-    # --- Connection type ---
     echo ""
     echo -e "${BOLD}Connection type for vNIC${nic_num}:${RESET}"
     echo "  Bridge    — VM connects via a shared Proxmox bridge to a physical NIC."
@@ -574,7 +563,6 @@ configure_vm_nics() {
       info "No free USB NICs available — using bridge."
     fi
 
-    # --- Bridge selection ---
     if [[ "$nic_type" == "bridge" ]]; then
       local bridge_opts=()
       for b in "${EXISTING_BRIDGES[@]:-}"; do bridge_opts+=("$b (existing)"); done
@@ -604,7 +592,6 @@ configure_vm_nics() {
       nic_mac="virtio-generated"
 
     else
-      # USB passthrough
       if [[ ${#available_usb[@]} -eq 1 ]]; then
         usb_iface=${available_usb[0]}
         nic_mac=${USB_NIC_MAC[$usb_iface]:-unknown}
@@ -625,7 +612,6 @@ configure_vm_nics() {
       ok "Reserved ${usb_iface}  MAC=${nic_mac}  bus=${USB_NIC_BUS_PATH[$usb_iface]:-unknown}  for ${vm_label} vNIC${nic_num}"
     fi
 
-    # --- IP / gateway / DNS ---
     local ip_cidr="" gw="" dns=""
     prompt_ip_cidr ip_cidr "${net_label}"
 
@@ -664,7 +650,7 @@ configure_vm_nics() {
 }
 
 # =============================================================================
-# Collect NIC config — Ansible first, then Server
+# Collect NIC config
 # =============================================================================
 if $CREATE_ANSIBLE; then
   header "Ansible Controller VM — NIC Configuration"
@@ -1041,9 +1027,7 @@ wait_for_ssh() {
 # Helper: run bootstrap script in a VM via TTY SSH
 #
 # Downloads the script to a temp file on the remote VM, then executes it.
-# This keeps stdin free for interactive prompts (/dev/tty reads) and avoids
-# the pipe-to-sudo TTY issue where sudo may reject or misbehave when its
-# script arrives on stdin, even with NOPASSWD and SSH -t -t flags.
+# Stderr is NOT suppressed in TTY mode so all output reaches the terminal.
 # =============================================================================
 BOOTSTRAP_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap"
 ANSIBLE_KEY_SERVER_PORT=9876
@@ -1099,13 +1083,6 @@ if $CREATE_SERVER; then
   ok "VM ${SERVER_VMID} started"
 fi
 
-# Boot both VMs simultaneously, then bootstrap sequentially with full TTY.
-# ansible.sh must run first — it starts the key server that server.sh fetches.
-# On single-host (both VMs here): ansible.sh blocks waiting for server.sh to
-#   fetch the key, so we run server.sh in a background subshell, then wait for
-#   ansible.sh to complete.
-# On single-VM runs (Ansible only or Server only): straightforward sequential.
-
 ANSIBLE_IP=""
 SERVER_IP=""
 
@@ -1124,8 +1101,6 @@ if $CREATE_SERVER; then
 fi
 
 if $CREATE_ANSIBLE && $CREATE_SERVER; then
-  # Both VMs on this host — run server.sh in background (waits for key),
-  # then run ansible.sh in foreground (blocks until key is fetched).
   ANSIBLE_KEY_URL="http://${ANSIBLE_IP}:${ANSIBLE_KEY_SERVER_PORT}/ansible_ridestatus.pub"
   SERVER_BOOTSTRAP_ENV="ANSIBLE_KEY_URL=${ANSIBLE_KEY_URL} ANSIBLE_VM_HOST=${ANSIBLE_IP}"
   if (( SERVER_DEFAULT_ROUTE_NIC_IDX >= 0 )); then
@@ -1142,11 +1117,9 @@ if $CREATE_ANSIBLE && $CREATE_SERVER; then
   wait "$SERVER_BOOTSTRAP_PID" 2>/dev/null || true
 
 elif $CREATE_ANSIBLE; then
-  # Ansible only on this host — run ansible.sh in foreground
   run_bootstrap "$ANSIBLE_IP" "ansible.sh" || true
 
 elif $CREATE_SERVER; then
-  # Server only on this host — server.sh will prompt for Ansible key URL
   SERVER_BOOTSTRAP_ENV=""
   if (( SERVER_DEFAULT_ROUTE_NIC_IDX >= 0 )); then
     SERVER_BOOTSTRAP_ENV="RS_DEFAULT_ROUTE_NIC_HINT=net${SERVER_DEFAULT_ROUTE_NIC_IDX}"
