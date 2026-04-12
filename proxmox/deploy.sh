@@ -14,6 +14,11 @@
 #     "https://api.github.com/repos/RideStatus/ridestatus-deploy/contents/proxmox/deploy.sh" \
 #     -o /tmp/deploy.sh && bash /tmp/deploy.sh
 #
+# GitHub token (read:packages) — store once per Proxmox host, never prompted again:
+#   mkdir -p /root/.config/ridestatus
+#   echo 'ghp_YOUR_TOKEN' > /root/.config/ridestatus/ghcr-token
+#   chmod 600 /root/.config/ridestatus/ghcr-token
+#
 # Requirements on Proxmox host:
 #   apt install dialog jq
 # =============================================================================
@@ -50,6 +55,16 @@ UBUNTU_IMG_PATH="/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img"
 SNIPPET_DIR="/var/lib/vz/snippets"
 COMPOSE_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/compose"
 SELF_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-manage/main/backend/scripts/self-update.sh"
+GHCR_TOKEN_FILE="/root/.config/ridestatus/ghcr-token"
+
+# =============================================================================
+# Load saved GitHub token if present
+# =============================================================================
+GITHUB_TOKEN=""
+if [[ -f "$GHCR_TOKEN_FILE" ]]; then
+  GITHUB_TOKEN=$(tr -d '[:space:]' < "$GHCR_TOKEN_FILE")
+  info "GitHub token loaded from ${GHCR_TOKEN_FILE}"
+fi
 
 # =============================================================================
 # Temp file for dialog output — avoids $() subshell losing the TTY
@@ -424,7 +439,6 @@ VM_IP="${VM_NIC_IPS[0]%%/*}"
 PARK_NAME="" PARK_TZ="" API_KEY="" BOOTSTRAP_TOKEN=""
 WEATHER_API_KEY="" WEATHER_ZIP="" ALERT_EMAIL=""
 SMTP_HOST="" SMTP_PORT="587" SMTP_USER="" SMTP_PASS=""
-GITHUB_TOKEN=""
 PROXMOX_API_HOST="" PROXMOX_API_PORT="8006"
 PROXMOX_API_USER="" PROXMOX_API_PASS="" PROXMOX_API_NODE=""
 
@@ -446,10 +460,8 @@ if [[ "$VM_ROLE" == "server" ]]; then
 fi
 
 if [[ "$VM_ROLE" == "manage" ]]; then
-  # NOTE: SERVER_URL and SERVER_API_KEY are intentionally not collected here.
-  # The park board server (SCADA 2) does not exist yet when the management plane
-  # is first deployed. These are left blank in .env — fill them in via the
-  # management UI once the server VM is deployed.
+  # NOTE: SERVER_URL and SERVER_API_KEY are not collected here — the park board
+  # server does not exist yet. They are left blank in .env and filled in later.
   wt_msg "Proxmox API credentials\n\nThe management plane uses the Proxmox API to provision new VMs.\nEnter the credentials for this Proxmox host."
   wt_input    PROXMOX_API_HOST "Proxmox API host (IP of this host):" "$(hostname -I | awk '{print $1}')"
   wt_input    PROXMOX_API_PORT "Proxmox API port:"                   "8006"
@@ -458,8 +470,12 @@ if [[ "$VM_ROLE" == "manage" ]]; then
   wt_input    PROXMOX_API_NODE "Proxmox node name:"                  "${PROXMOX_NODE}"
 fi
 
+# Prompt for GitHub token only if not already loaded from file
 if [[ "$VM_ROLE" == "manage" || "$VM_ROLE" == "edge" ]]; then
-  wt_password GITHUB_TOKEN "GitHub token (for pulling ghcr.io images):"
+  if [[ -z "$GITHUB_TOKEN" ]]; then
+    wt_msg "GitHub token not found at ${GHCR_TOKEN_FILE}\n\nYou will need to enter it manually.\nTo avoid this prompt on future deployments, store it once:\n\n  mkdir -p /root/.config/ridestatus\n  echo 'ghp_...' > ${GHCR_TOKEN_FILE}\n  chmod 600 ${GHCR_TOKEN_FILE}"
+    wt_password GITHUB_TOKEN "GitHub token (read:packages, for ghcr.io):"
+  fi
 fi
 
 # =============================================================================
