@@ -33,6 +33,7 @@ warn()   { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 err()    { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
 die()    { err "$*"; exit 1; }
 header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
+step()   { echo -e "${CYAN}  →${RESET} $*"; }
 
 # =============================================================================
 # Preflight
@@ -339,6 +340,18 @@ wait_agent() {
   echo ""; die "Timed out waiting for guest agent"
 }
 
+wait_http() {
+  local url=$1 elapsed=0
+  info "Waiting for dashboard at ${url}..."
+  while (( elapsed < 300 )); do
+    if curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null | grep -q "^[23]"; then
+      echo ""; ok "Dashboard is up"; return 0
+    fi
+    sleep 5; elapsed=$(( elapsed+5 )); echo -n "."
+  done
+  echo ""; warn "Dashboard did not respond within 5 minutes — check container logs"
+}
+
 purge_known_host() {
   ssh-keygen -f /root/.ssh/known_hosts -R "$1" &>/dev/null 2>&1 || true
 }
@@ -578,6 +591,7 @@ qm create "$VMID" --name "$VM_HOST" --memory "$RAM_MB" --cores "$VM_CORES" \
   --cpu cputype=host --ostype l26 --agent enabled=1 --serial0 socket --vga serial0
 
 IMG_COPY="${_WORK_DIR}/vm${VMID}.img"
+step "Copying base image..."
 cp "$UBUNTU_IMG_PATH" "$IMG_COPY"
 qm importdisk "$VMID" "$IMG_COPY" "$DISK_STORAGE" --format qcow2
 rm -f "$IMG_COPY"
@@ -658,7 +672,9 @@ ok "Docker installed"
 # =============================================================================
 if [[ -n "$GITHUB_TOKEN" ]]; then
   header "Logging into ghcr.io"
+  step "Authenticating on Proxmox host..."
   echo "$GITHUB_TOKEN" | docker login ghcr.io -u ridestatus --password-stdin 2>/dev/null || true
+  step "Authenticating on VM..."
   rssh "$VM_IP" "echo '${GITHUB_TOKEN}' | sudo docker login ghcr.io -u ridestatus --password-stdin"
   ok "Logged into ghcr.io"
 fi
@@ -719,21 +735,22 @@ ENV
     ;;
 esac
 
-# Download docker-compose.yml for this role
+step "Downloading docker-compose.yml..."
 COMPOSE_FILE="${_WORK_DIR}/docker-compose.yml"
 curl -fsSL "${COMPOSE_BASE_URL}/${VM_ROLE}/docker-compose.yml" -o "$COMPOSE_FILE" \
   || die "Failed to download docker-compose.yml for ${VM_ROLE}"
 
-# SCP both files to VM
+step "Copying configuration to VM..."
 rssh "$VM_IP" "sudo mkdir -p /opt/ridestatus && sudo chown ridestatus:ridestatus /opt/ridestatus"
 rscp "$ENV_FILE"     "$VM_IP" "/opt/ridestatus/.env"
 rscp "$COMPOSE_FILE" "$VM_IP" "/opt/ridestatus/docker-compose.yml"
-ok "Files deployed"
+ok "Configuration deployed"
 
 # =============================================================================
 # Start services
 # =============================================================================
 header "Starting Services"
+step "Pulling Docker images (this may take a few minutes)..."
 rssh_tty "$VM_IP" \
   "cd /opt/ridestatus && sudo docker compose pull && sudo docker compose up -d"
 ok "Services started"
@@ -744,14 +761,16 @@ ok "Services started"
 if [[ "$VM_ROLE" == "manage" ]]; then
   header "Configuring Automatic Updates"
 
+  step "Downloading self-update script..."
   SELF_UPDATE_LOCAL="${_WORK_DIR}/self-update.sh"
   curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
     -H "Accept: application/vnd.github.raw" \
     "https://api.github.com/repos/RideStatus/ridestatus-manage/contents/backend/scripts/self-update.sh" \
     -o "$SELF_UPDATE_LOCAL" \
     || die "Failed to download self-update.sh"
-  rscp "$SELF_UPDATE_LOCAL" "$VM_IP" "/tmp/self-update.sh"
 
+  step "Installing self-update script and cron job..."
+  rscp "$SELF_UPDATE_LOCAL" "$VM_IP" "/tmp/self-update.sh"
   rssh_tty "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
 set -e
 install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
@@ -783,10 +802,14 @@ AUTO_UPDATE
 fi
 
 # =============================================================================
+# Wait for dashboard to respond
+# =============================================================================
+wait_http "http://${VM_IP}:3000"
+
+# =============================================================================
 # Done
 # =============================================================================
 header "Deployment Complete"
-ok "VM ${VMID} (${VM_HOST}) — ${VM_IP}"
 echo ""
 rssh "$VM_IP" "sudo docker compose -f /opt/ridestatus/docker-compose.yml ps" 2>/dev/null || true
 echo ""
@@ -797,16 +820,16 @@ if $ADMIN_GENERATED; then
 fi
 
 if [[ "$VM_ROLE" == "server" ]]; then
-  ok "Park board: http://${VM_IP}:3000"
+  ok "Park board:      http://${VM_IP}:3000"
   ok "Bootstrap token: ${BOOTSTRAP_TOKEN}"
-  ok "API key: ${API_KEY}"
+  ok "API key:         ${API_KEY}"
   warn "Save the bootstrap token and API key — you will need them to connect edge nodes"
 fi
 
 if [[ "$VM_ROLE" == "manage" ]]; then
-  ok "Management UI: http://${VM_IP}:3000"
-  ok "Default login: admin / admin  (change immediately)"
-  ok "Self-update: runs every 30 min via cron, or use the Dashboard button"
+  ok "Management UI:  http://${VM_IP}:3000"
+  ok "Default login:  admin / admin  (change immediately)"
+  ok "Self-update:    runs every 30 min via cron, or use the Dashboard button"
   warn "SERVER_URL and SERVER_API_KEY in /opt/ridestatus/.env are blank."
   warn "Fill them in once the park board server is deployed."
 fi
