@@ -53,7 +53,6 @@ UBUNTU_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloud
 UBUNTU_IMG_PATH="/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img"
 SNIPPET_DIR="/var/lib/vz/snippets"
 COMPOSE_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/compose"
-SELF_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-manage/main/backend/scripts/self-update.sh"
 GHCR_TOKEN_FILE="/root/.config/ridestatus/ghcr-token"
 
 # =============================================================================
@@ -412,9 +411,9 @@ collect_nics() {
 
     local ip_cidr=""
     while true; do
-      wt_input ip_cidr "${vm_label} vNIC${nic_num} — Static IP/prefix (e.g. 10.250.5.101/19):" ""
+      wt_input ip_cidr "${vm_label} vNIC${nic_num} — Static IP/prefix (e.g. 10.0.1.10/24):" ""
       [[ "$ip_cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && break
-      wt_msg "Invalid format. Example: 10.250.5.101/19"
+      wt_msg "Invalid format. Example: 10.0.1.10/24"
     done
 
     local gw="" is_dr="no"
@@ -450,8 +449,8 @@ All settings collected now — no prompts during deployment."
 # =============================================================================
 VM_ROLE=""
 wt_menu VM_ROLE "Which VM should be created?" \
-  "manage" "Management Plane — ridestatus-manage (SCADA 1)" \
-  "server" "Park Board Server — ridestatus-server (SCADA 2)"
+  "manage" "Management Plane — ridestatus-manage" \
+  "server" "Park Board Server — ridestatus-server"
 
 [[ -z "$VM_ROLE" ]] && { echo "Cancelled."; exit 0; }
 
@@ -689,7 +688,7 @@ PROXMOX_USER=${PROXMOX_API_USER}
 PROXMOX_PASSWORD=${PROXMOX_API_PASS}
 PROXMOX_NODE=${PROXMOX_API_NODE}
 MANAGE_SSH_KEY_PATH=/home/ridestatus/.ssh/ansible_ridestatus
-# Fill in once ridestatus-server (SCADA 2) is deployed:
+# Fill in once ridestatus-server is deployed on the park board host:
 SERVER_URL=
 SERVER_API_KEY=
 GITHUB_TOKEN=${GITHUB_TOKEN}
@@ -809,6 +808,6 @@ if [[ "$VM_ROLE" == "manage" ]]; then
   ok "Default login: admin / admin  (change immediately)"
   ok "Self-update: runs every 30 min via cron, or use the Dashboard button"
   warn "SERVER_URL and SERVER_API_KEY in /opt/ridestatus/.env are blank."
-  warn "Fill them in once the park board server (SCADA 2) is deployed."
+  warn "Fill them in once the park board server is deployed."
 fi
 echo ""
