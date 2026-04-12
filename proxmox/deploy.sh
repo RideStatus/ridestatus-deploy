@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# RideStatus — Proxmox Deploy Script  (v2 — Docker Compose)
+# Ride Status — Proxmox Deploy Script  (v2 — Docker Compose)
 # https://github.com/RideStatus/ridestatus-deploy
 #
 # Run once per Proxmox host as root.
-# Creates a RideStatus VM, installs Docker, drops docker-compose.yml + .env,
+# Creates a Ride Status VM, installs Docker, drops docker-compose.yml + .env,
 # and starts services with docker compose up -d.
 #
 # No bootstrap scripts. No PM2. No Ansible installs. Docker handles everything.
@@ -13,11 +13,6 @@
 #   curl -fsSL -H "Accept: application/vnd.github.raw" \
 #     "https://api.github.com/repos/RideStatus/ridestatus-deploy/contents/proxmox/deploy.sh" \
 #     -o /tmp/deploy.sh && bash /tmp/deploy.sh
-#
-# GitHub token (read:packages) — store once per Proxmox host, never prompted again:
-#   mkdir -p /root/.config/ridestatus
-#   echo 'ghp_YOUR_TOKEN' > /root/.config/ridestatus/ghcr-token
-#   chmod 600 /root/.config/ridestatus/ghcr-token
 #
 # Requirements on Proxmox host:
 #   apt install dialog jq
@@ -58,13 +53,69 @@ SELF_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-
 GHCR_TOKEN_FILE="/root/.config/ridestatus/ghcr-token"
 
 # =============================================================================
-# Load saved GitHub token if present
+# Step 1 — GitHub token (plain terminal, no dialog)
+# Read from saved file if present; otherwise walk the user through creating one.
 # =============================================================================
 GITHUB_TOKEN=""
+
 if [[ -f "$GHCR_TOKEN_FILE" ]]; then
   GITHUB_TOKEN=$(tr -d '[:space:]' < "$GHCR_TOKEN_FILE")
-  info "GitHub token loaded from ${GHCR_TOKEN_FILE}"
+  echo ""
+  echo -e "${GREEN}========================================${RESET}"
+  echo -e "${BOLD}  Ride Status — Proxmox Deploy${RESET}"
+  echo -e "${GREEN}========================================${RESET}"
+  echo ""
+  ok "GitHub token loaded from ${GHCR_TOKEN_FILE}"
+  echo ""
+else
+  clear
+  echo ""
+  echo -e "${GREEN}========================================${RESET}"
+  echo -e "${BOLD}  Ride Status — Proxmox Deploy${RESET}"
+  echo -e "${GREEN}========================================${RESET}"
+  echo ""
+  echo -e "${BOLD}Step 1 of 1 — GitHub Token Setup${RESET}"
+  echo ""
+  echo "  Ride Status pulls Docker images from a private GitHub Container"
+  echo "  Registry (ghcr.io). A GitHub Personal Access Token (PAT) with"
+  echo "  read:packages scope is required."
+  echo ""
+  echo -e "  ${BOLD}How to create the token:${RESET}"
+  echo "  1. Go to: https://github.com/settings/tokens"
+  echo "  2. Click \"Generate new token (classic)\""
+  echo "  3. Name it: ride-status-deploy"
+  echo "  4. Set expiration: No expiration  (or your org's policy)"
+  echo "  5. Check ONLY: read:packages"
+  echo "  6. Click \"Generate token\""
+  echo "  7. Copy the token (starts with ghp_)"
+  echo ""
+  echo -e "  ${BOLD}Paste your token below and press Enter.${RESET}"
+  echo -e "  ${CYAN}(Paste works normally — the token will be saved to${RESET}"
+  echo -e "  ${CYAN} ${GHCR_TOKEN_FILE} so you won't be asked again.)${RESET}"
+  echo ""
+  read -r -p "  Token: " GITHUB_TOKEN
+  echo ""
+
+  if [[ -z "$GITHUB_TOKEN" ]]; then
+    die "No token entered. Exiting."
+  fi
+
+  # Validate it looks like a PAT
+  if [[ ! "$GITHUB_TOKEN" =~ ^gh[ps]_[A-Za-z0-9]+ ]]; then
+    warn "Token doesn't look like a GitHub PAT (expected ghp_ or ghs_ prefix). Continuing anyway."
+  fi
+
+  # Save for future runs
+  mkdir -p "$(dirname "$GHCR_TOKEN_FILE")"
+  echo "$GITHUB_TOKEN" > "$GHCR_TOKEN_FILE"
+  chmod 600 "$GHCR_TOKEN_FILE"
+  ok "Token saved to ${GHCR_TOKEN_FILE} — you won't be asked again on this host."
+  echo ""
 fi
+
+echo -e "  Press ${BOLD}Enter${RESET} to continue to the deployment wizard..."
+read -r
+clear
 
 # =============================================================================
 # Temp file for dialog output — avoids $() subshell losing the TTY
@@ -84,11 +135,11 @@ trap cleanup EXIT
 # =============================================================================
 WT_H=20; WT_W=72
 
-wt_msg() { dialog --title "RideStatus Deploy" --msgbox "$1" $WT_H $WT_W; }
+wt_msg() { dialog --title "Ride Status Deploy" --msgbox "$1" $WT_H $WT_W; }
 
 wt_input() {
   local _v=$1 _p=$2 _d=${3:-}
-  dialog --title "RideStatus Deploy" --inputbox "$_p" 10 $WT_W "$_d" 2>"$_DLG_TMP" || true
+  dialog --title "Ride Status Deploy" --inputbox "$_p" 10 $WT_W "$_d" 2>"$_DLG_TMP" || true
   local _val; _val=$(cat "$_DLG_TMP")
   [[ -z "$_val" && -n "$_d" ]] && _val="$_d"
   printf -v "$_v" '%s' "$_val"
@@ -96,17 +147,17 @@ wt_input() {
 
 wt_password() {
   local _v=$1 _p=$2
-  dialog --title "RideStatus Deploy" --passwordbox "$_p" 10 $WT_W 2>"$_DLG_TMP" || true
+  dialog --title "Ride Status Deploy" --passwordbox "$_p" 10 $WT_W 2>"$_DLG_TMP" || true
   printf -v "$_v" '%s' "$(cat "$_DLG_TMP")"
 }
 
 wt_menu() {
   local _v=$1 _p=$2; shift 2
-  dialog --title "RideStatus Deploy" --menu "$_p" $WT_H $WT_W 8 "$@" 2>"$_DLG_TMP" || true
+  dialog --title "Ride Status Deploy" --menu "$_p" $WT_H $WT_W 8 "$@" 2>"$_DLG_TMP" || true
   printf -v "$_v" '%s' "$(cat "$_DLG_TMP")"
 }
 
-wt_yesno() { dialog --title "RideStatus Deploy" --yesno "$1" 10 $WT_W; }
+wt_yesno() { dialog --title "Ride Status Deploy" --yesno "$1" 10 $WT_W; }
 
 # =============================================================================
 # Storage detection
@@ -384,12 +435,12 @@ collect_nics() {
 # =============================================================================
 # Welcome
 # =============================================================================
-wt_msg "Welcome to RideStatus Proxmox Deploy
+wt_msg "Welcome to Ride Status Proxmox Deploy
 
 Host: ${PROXMOX_NODE}
 Storage: OS=${DISK_STORAGE}  CI=${CI_STORAGE}
 
-Creates a VM, installs Docker, and starts RideStatus services.
+Creates a VM, installs Docker, and starts Ride Status services.
 All settings collected now — no prompts during deployment."
 
 # =============================================================================
@@ -462,20 +513,12 @@ fi
 if [[ "$VM_ROLE" == "manage" ]]; then
   # NOTE: SERVER_URL and SERVER_API_KEY are not collected here — the park board
   # server does not exist yet. They are left blank in .env and filled in later.
-  wt_msg "Proxmox API credentials\n\nThe management plane uses the Proxmox API to provision new VMs.\nEnter the credentials for this Proxmox host."
+  wt_msg "Proxmox API Credentials\n\nThe management plane uses the Proxmox API to provision new VMs.\nEnter the credentials for this Proxmox host."
   wt_input    PROXMOX_API_HOST "Proxmox API host (IP of this host):" "$(hostname -I | awk '{print $1}')"
   wt_input    PROXMOX_API_PORT "Proxmox API port:"                   "8006"
   wt_input    PROXMOX_API_USER "Proxmox API user (e.g. root@pam):"   "root@pam"
   wt_password PROXMOX_API_PASS "Proxmox API password:"
   wt_input    PROXMOX_API_NODE "Proxmox node name:"                  "${PROXMOX_NODE}"
-fi
-
-# Prompt for GitHub token only if not already loaded from file
-if [[ "$VM_ROLE" == "manage" || "$VM_ROLE" == "edge" ]]; then
-  if [[ -z "$GITHUB_TOKEN" ]]; then
-    wt_msg "GitHub token not found at ${GHCR_TOKEN_FILE}\n\nYou will need to enter it manually.\nTo avoid this prompt on future deployments, store it once:\n\n  mkdir -p /root/.config/ridestatus\n  echo 'ghp_...' > ${GHCR_TOKEN_FILE}\n  chmod 600 ${GHCR_TOKEN_FILE}"
-    wt_password GITHUB_TOKEN "GitHub token (read:packages, for ghcr.io):"
-  fi
 fi
 
 # =============================================================================
@@ -612,7 +655,7 @@ DOCKER_INSTALL
 ok "Docker installed"
 
 # =============================================================================
-# Login to ghcr.io if GitHub token provided
+# Login to ghcr.io
 # =============================================================================
 if [[ -n "$GITHUB_TOKEN" ]]; then
   header "Logging into ghcr.io"
