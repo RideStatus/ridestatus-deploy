@@ -25,9 +25,9 @@
 #   RS_DEFAULT_ROUTE_NIC_HINT — vNIC index hint for DEFAULT_ROUTE_INTERFACE
 #
 # User switching:
-#   The script runs as root but uses runuser -l ridestatus -c "..." for all
-#   commands that must run as the ridestatus user. This correctly sets HOME,
-#   PATH, and environment variables for that user without requiring a TTY.
+#   Runs as root; uses runuser -l ridestatus -c for user-context operations.
+#   SSH keypairs are generated to a tmpdir outside ~/.ssh/ then moved in,
+#   to avoid sshd dropping the session on inotify events in ~/.ssh/.
 #
 # Interactive reads:
 #   All prompts use /dev/tty so they work when the script is piped from curl.
@@ -48,11 +48,26 @@ die()    { echo -e "${RED}[server.sh] ERROR:${RESET} $*" >&2; exit 1; }
 header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
 
 # Run a command as the ridestatus user with a proper login environment.
-# Usage: as_rs "command string"
 as_rs() { runuser -l ridestatus -c "$1"; }
 
+# Generate an SSH keypair safely without disturbing the active SSH session.
+# Keys are generated to a tmpdir OUTSIDE ~/.ssh/ then moved in atomically.
+# Writing directly into ~/.ssh/ can cause sshd to drop the session.
+gen_keypair() {
+  local keyfile=$1 comment=$2
+  local tmpdir
+  tmpdir=$(mktemp -d /tmp/ridestatus-keygen-XXXXXX)
+  local tmpkey="${tmpdir}/key"
+  ssh-keygen -t ed25519 -f "$tmpkey" -N "" -C "$comment" -q
+  mv "${tmpkey}"     "$keyfile"
+  mv "${tmpkey}.pub" "${keyfile}.pub"
+  chmod 600 "$keyfile"
+  chmod 644 "${keyfile}.pub"
+  chown "${RS_USER}:${RS_USER}" "$keyfile" "${keyfile}.pub"
+  rm -rf "$tmpdir"
+}
+
 # All interactive reads go through /dev/tty so they work when stdin is a pipe.
-# prompt_tty VARNAME "Display message" ["default value"]
 prompt_tty() {
   local -n _pt_var=$1; local msg=$2; local def=${3:-}
   local prompt
@@ -248,9 +263,9 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
   done
 
   if [[ "$GITHUB_AUTH_METHOD" == "1" ]]; then
-    # Deploy key — generate as ridestatus user so ownership is correct
+    # Deploy key — generate via tmpdir to avoid sshd session drop
     if [[ ! -f "${GITHUB_KEY}" ]]; then
-      as_rs "ssh-keygen -t ed25519 -f '${GITHUB_KEY}' -N '' -C 'ridestatus-server-deploy' -q"
+      gen_keypair "${GITHUB_KEY}" "ridestatus-server-deploy"
       ok "GitHub deploy key generated: ${GITHUB_KEY}"
     fi
 
@@ -269,7 +284,7 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
     _enter=""
     read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")" _enter </dev/tty
 
-    # Configure SSH for github.com as ridestatus user
+    # Configure SSH for github.com
     SSH_CONFIG="${RS_HOME}/.ssh/config"
     if ! grep -q "Host github.com" "$SSH_CONFIG" 2>/dev/null; then
       cat >> "$SSH_CONFIG" << EOF
@@ -501,7 +516,6 @@ ok "npm install complete"
 
 header "Running Database Migrations"
 
-# Pass DB credentials explicitly so migrate.js connects without prompting
 as_rs "cd '${SERVER_DIR}' && \
   POSTGRES_HOST=localhost \
   POSTGRES_PORT=5432 \
@@ -520,13 +534,11 @@ header "Starting RideStatus Server (PM2)"
 mkdir -p "${LOG_DIR}"
 chown "${RS_USER}:${RS_USER}" "${LOG_DIR}"
 
-# Copy ecosystem config to RS_HOME so PM2 can find it on boot
 ECOSYSTEM_SRC="${SERVER_DIR}/ecosystem.config.js"
 ECOSYSTEM_DEST="${RS_HOME}/ecosystem.config.js"
 cp "$ECOSYSTEM_SRC" "$ECOSYSTEM_DEST"
 chown "${RS_USER}:${RS_USER}" "$ECOSYSTEM_DEST"
 
-# Start or reload
 if as_rs "pm2 describe ridestatus-server" &>/dev/null; then
   info "PM2 process already exists — reloading"
   as_rs "pm2 reload ridestatus-server --update-env"
@@ -536,17 +548,12 @@ fi
 
 as_rs "pm2 save"
 
-# Configure PM2 systemd startup.
-# pm2 startup prints a command like:
-#   sudo env PATH=... pm2 startup systemd -u ridestatus --hp /home/ridestatus
-# We capture and run it directly as root.
 PM2_STARTUP_CMD=$(as_rs "pm2 startup systemd -u ${RS_USER} --hp ${RS_HOME}" 2>/dev/null \
   | grep -o 'sudo env PATH.*' || true)
 
 if [[ -n "$PM2_STARTUP_CMD" ]]; then
   eval "$PM2_STARTUP_CMD"
 else
-  # Already configured or pm2 handled it inline
   pm2 startup systemd -u "$RS_USER" --hp "$RS_HOME" 2>/dev/null || true
 fi
 
