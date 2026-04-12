@@ -1,0 +1,20 @@
+# ridestatus-edge docker-compose.yml
+services:
+  poller:
+    image: ghcr.io/ridestatus/ridestatus-ride:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ride_data:/data
+
+  nodered:
+    image: nodered/node-red:latest
+    restart: unless-stopped
+    ports:
+      - "1880:1880"
+    volumes:
+      - nodered_data:/data
+
+volumes:
+  ride_data:
+  nodered_data:
