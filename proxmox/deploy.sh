@@ -284,8 +284,12 @@ DEPLOY_PUBKEY_CONTENT=$(cat "${DEPLOY_KEY}.pub")
 
 # =============================================================================
 # SSH helpers
-# rssh     — non-interactive, BatchMode, no TTY (default for all remote calls)
-# rssh_tty — interactive TTY only where truly needed (docker compose pull/up)
+#
+# rssh      — BatchMode=yes, no TTY. For simple remote commands.
+# rssh_pipe — No BatchMode, no TTY. For piping heredocs (sudo bash -s).
+#             Output streams to the calling terminal normally.
+# rssh_tty  — Interactive TTY (-t -t). Only for docker compose pull/up
+#             which renders progress bars requiring a TTY.
 # =============================================================================
 _ssh_base_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes"
 
@@ -296,6 +300,19 @@ rssh() {
     # shellcheck disable=SC2086
     SSH_AUTH_SOCK="" ssh -i "$key" $_ssh_base_opts -o BatchMode=yes "ridestatus@${ip}" "$@" \
       2>/dev/null && return 0
+  done
+  return 1
+}
+
+rssh_pipe() {
+  # Like rssh but without BatchMode — allows stdin/heredoc piping.
+  # Output (stdout+stderr) streams directly to the terminal.
+  local ip=$1; shift
+  for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
+    [[ -f "$key" ]] || continue
+    # shellcheck disable=SC2086
+    SSH_AUTH_SOCK="" ssh -i "$key" $_ssh_base_opts "ridestatus@${ip}" "$@" \
+      && return 0
   done
   return 1
 }
@@ -647,11 +664,10 @@ wait_ssh "$VM_IP"
 
 # =============================================================================
 # Install Docker
-# rssh (no TTY) pipes the heredoc — output streams normally without hijacking
-# the terminal session.
+# Uses rssh_pipe — no TTY, stdin piping allowed, output streams to terminal.
 # =============================================================================
 header "Installing Docker"
-rssh "$VM_IP" "sudo bash -s" <<'DOCKER_INSTALL'
+rssh_pipe "$VM_IP" "sudo bash -s" <<'DOCKER_INSTALL'
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -752,8 +768,7 @@ ok "Configuration deployed"
 
 # =============================================================================
 # Start services
-# rssh_tty is used here because docker compose pull streams progress bars
-# that require a TTY to render correctly.
+# rssh_tty — docker compose pull needs a TTY for progress bar rendering.
 # =============================================================================
 header "Starting Services"
 step "Pulling Docker images (this may take a few minutes)..."
@@ -763,7 +778,7 @@ ok "Services started"
 
 # =============================================================================
 # Automatic updates (manage role only)
-# Uses plain rssh — no TTY needed, avoids terminal session confusion.
+# Uses rssh_pipe — no TTY, stdin piping allowed, output streams to terminal.
 # =============================================================================
 if [[ "$VM_ROLE" == "manage" ]]; then
   header "Configuring Automatic Updates"
@@ -778,7 +793,7 @@ if [[ "$VM_ROLE" == "manage" ]]; then
 
   step "Installing self-update script and cron job..."
   rscp "$SELF_UPDATE_LOCAL" "$VM_IP" "/tmp/self-update.sh"
-  rssh "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
+  rssh_pipe "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
 set -e
 install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
 chown root:root /opt/ridestatus/self-update.sh
@@ -803,6 +818,7 @@ APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 CONF
 systemctl enable --now unattended-upgrades
+echo "Automatic updates configured"
 AUTO_UPDATE
   ok "Self-update cron installed (every 30 min)"
   ok "unattended-upgrades enabled (security patches, no auto-reboot)"
