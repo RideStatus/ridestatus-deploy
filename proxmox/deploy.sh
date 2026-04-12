@@ -46,6 +46,56 @@ ADMIN_KEY_PATH="/root/ridestatus-admin-key"
 BOOTSTRAP_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap"
 ANSIBLE_KEY_SERVER_PORT=9876
 
+# Temp file for dialog output — avoids $() subshell which loses the TTY
+_DLG_TMP=$(mktemp /tmp/ridestatus-dlg-XXXXXX)
+trap 'rm -f "$_DLG_TMP"' EXIT
+
+# =============================================================================
+# dialog helpers
+# All use $_DLG_TMP instead of $() to preserve the controlling terminal.
+# =============================================================================
+WT_H=20; WT_W=72
+
+wt_msg() {
+  dialog --title "RideStatus Deploy" --msgbox "$1" $WT_H $WT_W
+}
+
+# wt_input VARNAME "prompt" "default"
+wt_input() {
+  local _varname=$1 _prompt=$2 _default=${3:-}
+  dialog --title "RideStatus Deploy" --inputbox "$_prompt" 10 $WT_W "$_default" \
+    2>"$_DLG_TMP" || true
+  local _val
+  _val=$(cat "$_DLG_TMP")
+  [[ -z "$_val" && -n "$_default" ]] && _val="$_default"
+  printf -v "$_varname" '%s' "$_val"
+}
+
+# wt_password VARNAME "prompt"
+wt_password() {
+  local _varname=$1 _prompt=$2
+  dialog --title "RideStatus Deploy" --passwordbox "$_prompt" 10 $WT_W \
+    2>"$_DLG_TMP" || true
+  local _val
+  _val=$(cat "$_DLG_TMP")
+  printf -v "$_varname" '%s' "$_val"
+}
+
+# wt_menu VARNAME "prompt" tag1 desc1 tag2 desc2 ...
+wt_menu() {
+  local _varname=$1 _prompt=$2; shift 2
+  dialog --title "RideStatus Deploy" --menu "$_prompt" $WT_H $WT_W 8 "$@" \
+    2>"$_DLG_TMP" || true
+  local _val
+  _val=$(cat "$_DLG_TMP")
+  printf -v "$_varname" '%s' "$_val"
+}
+
+# wt_yesno "prompt" — returns 0=yes 1=no
+wt_yesno() {
+  dialog --title "RideStatus Deploy" --yesno "$1" 10 $WT_W
+}
+
 # =============================================================================
 # Detect storage
 # =============================================================================
@@ -177,34 +227,10 @@ DEPLOY_PUBKEY_CONTENT=$(cat "$DEPLOY_PUBKEY")
 
 cleanup() {
   rm -rf "$DEPLOY_KEY_DIR"
+  rm -f "$_DLG_TMP"
   rm -f "${SNIPPET_DIR}/ridestatus-userdata-"*.yaml 2>/dev/null || true
 }
 trap cleanup EXIT
-
-# =============================================================================
-# dialog helpers
-# =============================================================================
-WT_H=20; WT_W=72
-
-wt_msg()  { dialog --title "RideStatus Deploy" --msgbox      "$1" $WT_H $WT_W; }
-wt_input() {
-  # wt_input VARNAME "prompt" "default"
-  local -n _wi=$1
-  _wi=$(dialog --title "RideStatus Deploy" --inputbox "$2" 10 $WT_W "$3" 3>&1 1>&2 2>&3) || true
-  [[ -z "$_wi" && -n "${3:-}" ]] && _wi="$3"
-}
-wt_password() {
-  local -n _wp=$1
-  _wp=$(dialog --title "RideStatus Deploy" --passwordbox "$2" 10 $WT_W 3>&1 1>&2 2>&3) || true
-}
-wt_menu() {
-  # wt_menu VARNAME "prompt" item1 desc1 item2 desc2 ...
-  local -n _wm=$1; local prompt=$2; shift 2
-  _wm=$(dialog --title "RideStatus Deploy" --menu "$prompt" $WT_H $WT_W 8 "$@" 3>&1 1>&2 2>&3) || true
-}
-wt_yesno() {
-  dialog --title "RideStatus Deploy" --yesno "$1" 10 $WT_W
-}
 
 # =============================================================================
 # Welcome
@@ -263,9 +289,7 @@ collect_nics() {
       for u in "${available_usb[@]}"; do
         conn_items+=("usb:${u}" "USB passthrough: ${u}  MAC=${USB_NIC_MAC[$u]}  bus=${USB_NIC_BUS[$u]}")
       done
-      local conn_sel=""
-      wt_menu conn_sel "${vm_label} vNIC${nic_num} (${net_label}) — Connection type:" "${conn_items[@]}"
-      nic_type="$conn_sel"
+      wt_menu nic_type "${vm_label} vNIC${nic_num} (${net_label}) — Connection type:" "${conn_items[@]}"
     else
       nic_type="bridge"
       wt_msg "No free USB NICs available — vNIC${nic_num} will use a bridge."
@@ -330,10 +354,10 @@ This NIC handles internet traffic (updates, alerts, weather)."; then
     fi
     wt_input dns "DNS server for vNIC${nic_num}:" "8.8.8.8"
 
-    NIC_TYPES+=("$nic_type");   NIC_LABELS+=("$net_label")
+    NIC_TYPES+=("$nic_type");    NIC_LABELS+=("$net_label")
     NIC_BRIDGES+=("$bridge_name"); NIC_USBS+=("$usb_iface")
-    NIC_MACS+=("$nic_mac");     NIC_IPS+=("$ip_cidr")
-    NIC_GWS+=("$gw");           NIC_DNSS+=("$dns")
+    NIC_MACS+=("$nic_mac");      NIC_IPS+=("$ip_cidr")
+    NIC_GWS+=("$gw");            NIC_DNSS+=("$dns")
     NIC_DR+=("$is_dr")
 
     wt_yesno "Add another NIC to ${vm_label}?" || break
@@ -353,17 +377,17 @@ if $CREATE_ANSIBLE; then
   while pvesh get "/nodes/${PROXMOX_NODE}/qemu/${next_vmid}/status" &>/dev/null 2>&1; do
     next_vmid=$(( next_vmid + 1 ))
   done
-  wt_input ANSIBLE_VMID "Ansible Controller VM ID:" "$next_vmid"
-  wt_input ANSIBLE_RAM   "Ansible VM RAM (GB):"      "2"
-  wt_input ANSIBLE_CORES "Ansible VM CPU cores:"     "2"
-  wt_input ANSIBLE_DISK  "Ansible VM disk (GB):"     "20"
-  wt_input ANSIBLE_HOST  "Ansible VM hostname:"      "ridestatus-ansible"
+  wt_input ANSIBLE_VMID "Ansible Controller VM ID:"  "$next_vmid"
+  wt_input ANSIBLE_RAM   "Ansible VM RAM (GB):"       "2"
+  wt_input ANSIBLE_CORES "Ansible VM CPU cores:"      "2"
+  wt_input ANSIBLE_DISK  "Ansible VM disk (GB):"      "20"
+  wt_input ANSIBLE_HOST  "Ansible VM hostname:"       "ridestatus-ansible"
 
   collect_nics "Ansible VM"
-  A_NIC_TYPES=("${NIC_TYPES[@]}");   A_NIC_LABELS=("${NIC_LABELS[@]}")
+  A_NIC_TYPES=("${NIC_TYPES[@]}");    A_NIC_LABELS=("${NIC_LABELS[@]}")
   A_NIC_BRIDGES=("${NIC_BRIDGES[@]}"); A_NIC_USBS=("${NIC_USBS[@]}")
-  A_NIC_MACS=("${NIC_MACS[@]}");     A_NIC_IPS=("${NIC_IPS[@]}")
-  A_NIC_GWS=("${NIC_GWS[@]}");       A_NIC_DNSS=("${NIC_DNSS[@]}")
+  A_NIC_MACS=("${NIC_MACS[@]}");      A_NIC_IPS=("${NIC_IPS[@]}")
+  A_NIC_GWS=("${NIC_GWS[@]}");        A_NIC_DNSS=("${NIC_DNSS[@]}")
   A_NIC_DR=("${NIC_DR[@]}")
 fi
 
@@ -387,10 +411,10 @@ if $CREATE_SERVER; then
   wt_input SERVER_HOST   "Server VM hostname:"         "ridestatus-server"
 
   collect_nics "Server VM"
-  S_NIC_TYPES=("${NIC_TYPES[@]}");   S_NIC_LABELS=("${NIC_LABELS[@]}")
+  S_NIC_TYPES=("${NIC_TYPES[@]}");    S_NIC_LABELS=("${NIC_LABELS[@]}")
   S_NIC_BRIDGES=("${NIC_BRIDGES[@]}"); S_NIC_USBS=("${NIC_USBS[@]}")
-  S_NIC_MACS=("${NIC_MACS[@]}");     S_NIC_IPS=("${NIC_IPS[@]}")
-  S_NIC_GWS=("${NIC_GWS[@]}");       S_NIC_DNSS=("${NIC_DNSS[@]}")
+  S_NIC_MACS=("${NIC_MACS[@]}");      S_NIC_IPS=("${NIC_IPS[@]}")
+  S_NIC_GWS=("${NIC_GWS[@]}");        S_NIC_DNSS=("${NIC_DNSS[@]}")
   S_NIC_DR=("${NIC_DR[@]}")
   for i in "${!S_NIC_DR[@]}"; do
     [[ "${S_NIC_DR[$i]}" == "yes" ]] && SERVER_DR_IDX=$i && break
@@ -406,15 +430,15 @@ ALERT_EMAIL="" ALERT_SMS=""
 SMTP_HOST="" SMTP_PORT="587" SMTP_USER="" SMTP_PASS=""
 
 if $CREATE_SERVER; then
-  wt_input PARK_NAME       "Park name:"                           "My Park"
-  wt_input PARK_TZ         "Timezone (e.g. America/Chicago):"     "America/Chicago"
-  wt_input WEATHER_API_KEY "WeatherAPI.com key (leave blank to skip):" ""
-  wt_input WEATHER_ZIP     "Weather ZIP code:"                    "00000"
-  wt_input ALERT_EMAIL     "Alert email address (optional):"      ""
-  wt_input ALERT_SMS       "Alert SMS address (optional):"        ""
-  wt_input SMTP_HOST       "SMTP host (optional):"                ""
-  wt_input SMTP_PORT       "SMTP port:"                           "587"
-  wt_input SMTP_USER       "SMTP username (optional):"            ""
+  wt_input PARK_NAME       "Park name:"                              "My Park"
+  wt_input PARK_TZ         "Timezone (e.g. America/Chicago):"        "America/Chicago"
+  wt_input WEATHER_API_KEY "WeatherAPI.com key (blank to skip):"     ""
+  wt_input WEATHER_ZIP     "Weather ZIP code:"                       "00000"
+  wt_input ALERT_EMAIL     "Alert email address (optional):"         ""
+  wt_input ALERT_SMS       "Alert SMS address (optional):"           ""
+  wt_input SMTP_HOST       "SMTP host (optional):"                   ""
+  wt_input SMTP_PORT       "SMTP port:"                              "587"
+  wt_input SMTP_USER       "SMTP username (optional):"               ""
   if [[ -n "$SMTP_HOST" ]]; then
     wt_password SMTP_PASS "SMTP password:"
   fi
@@ -431,8 +455,8 @@ wt_menu GITHUB_AUTH_METHOD "GitHub access for private repos:" \
   "pat"        "Personal access token (PAT) — simpler, enter once"
 
 if [[ "$GITHUB_AUTH_METHOD" == "pat" ]]; then
-  wt_input   GITHUB_USER "GitHub username:" ""
-  wt_password GITHUB_PAT "GitHub PAT:"
+  wt_input    GITHUB_USER "GitHub username:" ""
+  wt_password GITHUB_PAT  "GitHub PAT:"
 fi
 
 # =============================================================================
@@ -444,7 +468,7 @@ if [[ -f "${ADMIN_KEY_PATH}.pub" ]]; then
   ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
   wt_msg "Using existing admin SSH key:\n${ADMIN_KEY_PATH}"
 else
-  wt_input ADMIN_SSH_PUBKEY "Paste SSH public key (leave blank to auto-generate):" ""
+  wt_input ADMIN_SSH_PUBKEY "Paste SSH public key (blank to auto-generate):" ""
   if [[ -z "$ADMIN_SSH_PUBKEY" ]]; then
     ssh-keygen -t ed25519 -f "$ADMIN_KEY_PATH" -N "" -C "ridestatus-admin" -q
     ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
@@ -658,8 +682,9 @@ fix_usb_nic_names() {
 
   [[ ${#ga_map[@]} -eq 0 ]] && { warn "Guest agent returned no NIC data"; return 0; }
 
-  local usb_slot=0 needs_fix=false
+  local usb_slot=0
   declare -A real_names=()
+  local needs_fix=false
   for i in "${!fnn_type[@]}"; do
     [[ "${fnn_type[$i]}" != "usb" ]] && continue
     local hm; hm=$(iface_mac "${fnn_usb[$i]}" | tr '[:upper:]' '[:lower:]')
@@ -690,9 +715,6 @@ fix_usb_nic_names() {
 
 # =============================================================================
 # Bootstrap runner
-# Step 1: download script non-interactively
-# Step 2: write env file
-# Step 3: execute with TTY — sudo bash as direct SSH command (no wrapper shell)
 # =============================================================================
 run_bootstrap() {
   local ip=$1 script=$2 env_vars=${3:-}
