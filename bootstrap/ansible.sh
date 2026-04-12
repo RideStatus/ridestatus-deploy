@@ -20,17 +20,13 @@
 #   9. Starts a one-shot HTTP key server on port 9876 so that server.sh
 #      can fetch the Ansible public key automatically.
 #
-# User switching:
-#   SSH keypairs are generated as root then chowned to ridestatus. To avoid
-#   sshd dropping the session when new files are created in ~/.ssh/ (sshd
-#   watches that directory), keypairs are first generated to a temp directory
-#   outside ~/.ssh/ and then moved in atomically.
-#
-# Interactive reads:
-#   All prompts use /dev/tty so they work when the script is piped from curl.
+# Interactive input:
+#   The script re-opens stdin from /dev/tty at startup so all prompts work
+#   correctly under sudo (which closes the controlling terminal). If /dev/tty
+#   is unavailable the script falls back to the original stdin.
 #
 # Usage (called by deploy.sh via SSH, or manually):
-#   curl -fsSL https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap/ansible.sh | sudo bash
+#   sudo bash /path/to/ansible.sh
 # =============================================================================
 
 set -euo pipefail
@@ -44,14 +40,17 @@ warn()   { echo -e "${YELLOW}[ansible.sh]${RESET} $*"; }
 die()    { echo -e "${RED}[ansible.sh] ERROR:${RESET} $*" >&2; exit 1; }
 header() { echo -e "\n${BOLD}${CYAN}=== $* ===${RESET}"; }
 
+# Re-open stdin from /dev/tty so interactive prompts work under sudo.
+# sudo closes the controlling terminal; this re-attaches it.
+if [[ -c /dev/tty ]]; then
+  exec </dev/tty
+fi
+
 # Run a command as the ridestatus user with a proper login environment.
 as_rs() { runuser -l ridestatus -c "$1"; }
 
 # Generate an SSH keypair safely without disturbing the active SSH session.
-# Keys are generated to a temp directory OUTSIDE ~/.ssh/ first, then moved in
-# atomically. Writing directly into ~/.ssh/ can cause sshd to drop the session
-# because it inotify-watches that directory for authorized_keys changes.
-# Usage: gen_keypair /path/to/key "comment"
+# Keys are generated to a tmpdir OUTSIDE ~/.ssh/ then moved in atomically.
 gen_keypair() {
   local keyfile=$1 comment=$2
   local tmpdir
@@ -66,22 +65,20 @@ gen_keypair() {
   rm -rf "$tmpdir"
 }
 
-# All interactive reads go through /dev/tty so they work when stdin is a pipe.
-prompt_tty() {
-  local -n _pt_var=$1; local msg=$2; local def=${3:-}
-  local prompt
+# Simple prompt helpers — stdin is already /dev/tty from exec above.
+prompt() {
+  local -n _p_var=$1; local msg=$2; local def=${3:-}
   if [[ -n "$def" ]]; then
-    prompt="$(echo -e "${BOLD}${msg}${RESET} [${def}]: ")"
+    read -rp "$(echo -e "${BOLD}${msg}${RESET} [${def}]: ")" _p_var
+    [[ -z "$_p_var" ]] && _p_var="$def"
   else
-    prompt="$(echo -e "${BOLD}${msg}${RESET}: ")"
+    read -rp "$(echo -e "${BOLD}${msg}${RESET}: ")" _p_var
   fi
-  read -rp "$prompt" _pt_var </dev/tty
-  [[ -n "$def" && -z "$_pt_var" ]] && _pt_var="$def"
 }
 
-prompt_tty_secret() {
-  local -n _pts_var=$1; local msg=$2
-  read -rsp "$(echo -e "${BOLD}${msg}${RESET}: ")" _pts_var </dev/tty
+prompt_secret() {
+  local -n _ps_var=$1; local msg=$2
+  read -rsp "$(echo -e "${BOLD}${msg}${RESET}: ")" _ps_var
   echo ""
 }
 
@@ -204,13 +201,13 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
 
   GITHUB_AUTH_METHOD=""
   while true; do
-    prompt_tty GITHUB_AUTH_METHOD "Choose" "1"
+    prompt GITHUB_AUTH_METHOD "Choose" "1"
     [[ "$GITHUB_AUTH_METHOD" =~ ^[12]$ ]] && break
     warn "Enter 1 or 2."
   done
 
   if [[ "$GITHUB_AUTH_METHOD" == "1" ]]; then
-    # Deploy key — generate via temp dir to avoid sshd session drop
+    # Deploy key — generate via tmpdir to avoid sshd session drop
     if [[ ! -f "${GITHUB_KEY}" ]]; then
       gen_keypair "${GITHUB_KEY}" "ridestatus-ansible-deploy"
       ok "GitHub deploy key generated: ${GITHUB_KEY}"
@@ -232,7 +229,7 @@ if [[ "$GITHUB_CREDS_CONFIGURED" == "false" ]]; then
     echo -e "${BOLD}  Steps: Settings → Deploy keys → Add deploy key → paste key → Allow write access: NO${RESET}"
     echo ""
     _enter=""
-    read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")" _enter </dev/tty
+    read -rp "$(echo -e "${BOLD}Press Enter once you have added the deploy key to GitHub...${RESET}")" _enter
 
     # Configure SSH to use this key for github.com
     SSH_CONFIG="${RS_HOME}/.ssh/config"
@@ -282,8 +279,8 @@ EOF
     echo "  Token type: Classic"
     echo "  Scopes needed: repo (read-only is sufficient)"
     echo ""
-    prompt_tty GITHUB_USER "GitHub username"
-    prompt_tty_secret GITHUB_PAT "GitHub PAT (input hidden)"
+    prompt GITHUB_USER "GitHub username"
+    prompt_secret GITHUB_PAT "GitHub PAT (input hidden)"
 
     if [[ -z "$GITHUB_USER" || -z "$GITHUB_PAT" ]]; then
       warn "Username or PAT was empty — skipping GitHub credential storage"
