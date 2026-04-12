@@ -427,7 +427,6 @@ SMTP_HOST="" SMTP_PORT="587" SMTP_USER="" SMTP_PASS=""
 GITHUB_TOKEN=""
 PROXMOX_API_HOST="" PROXMOX_API_PORT="8006"
 PROXMOX_API_USER="" PROXMOX_API_PASS="" PROXMOX_API_NODE=""
-SERVER_URL="" SERVER_API_KEY_VAL=""
 
 if [[ "$VM_ROLE" == "server" ]]; then
   wt_input PARK_NAME       "Park name:"                       "My Park"
@@ -447,14 +446,16 @@ if [[ "$VM_ROLE" == "server" ]]; then
 fi
 
 if [[ "$VM_ROLE" == "manage" ]]; then
+  # NOTE: SERVER_URL and SERVER_API_KEY are intentionally not collected here.
+  # The park board server (SCADA 2) does not exist yet when the management plane
+  # is first deployed. These are left blank in .env — fill them in via the
+  # management UI once the server VM is deployed.
   wt_msg "Proxmox API credentials\n\nThe management plane uses the Proxmox API to provision new VMs.\nEnter the credentials for this Proxmox host."
   wt_input    PROXMOX_API_HOST "Proxmox API host (IP of this host):" "$(hostname -I | awk '{print $1}')"
   wt_input    PROXMOX_API_PORT "Proxmox API port:"                   "8006"
   wt_input    PROXMOX_API_USER "Proxmox API user (e.g. root@pam):"   "root@pam"
   wt_password PROXMOX_API_PASS "Proxmox API password:"
   wt_input    PROXMOX_API_NODE "Proxmox node name:"                  "${PROXMOX_NODE}"
-  wt_input    SERVER_URL       "Park board server URL (or blank):"   "http://10.250.5.102:3000"
-  wt_input    SERVER_API_KEY_VAL "Park board API key (or blank):"    ""
 fi
 
 if [[ "$VM_ROLE" == "manage" || "$VM_ROLE" == "edge" ]]; then
@@ -599,9 +600,7 @@ ok "Docker installed"
 # =============================================================================
 if [[ -n "$GITHUB_TOKEN" ]]; then
   header "Logging into ghcr.io"
-  # Login on the Proxmox host (for any local docker operations)
   echo "$GITHUB_TOKEN" | docker login ghcr.io -u ridestatus --password-stdin 2>/dev/null || true
-  # Login on the VM so docker compose pull can succeed
   rssh "$VM_IP" "echo '${GITHUB_TOKEN}' | sudo docker login ghcr.io -u ridestatus --password-stdin"
   ok "Logged into ghcr.io"
 fi
@@ -631,8 +630,9 @@ PROXMOX_USER=${PROXMOX_API_USER}
 PROXMOX_PASSWORD=${PROXMOX_API_PASS}
 PROXMOX_NODE=${PROXMOX_API_NODE}
 MANAGE_SSH_KEY_PATH=/home/ridestatus/.ssh/ansible_ridestatus
-SERVER_URL=${SERVER_URL}
-SERVER_API_KEY=${SERVER_API_KEY_VAL}
+# Fill in once ridestatus-server (SCADA 2) is deployed:
+SERVER_URL=
+SERVER_API_KEY=
 GITHUB_TOKEN=${GITHUB_TOKEN}
 ENV
     ;;
@@ -689,12 +689,10 @@ ok "Services started"
 
 # =============================================================================
 # Automatic updates (manage role only)
-# Self-update script + cron every 30 min + unattended-upgrades for OS patches
 # =============================================================================
 if [[ "$VM_ROLE" == "manage" ]]; then
   header "Configuring Automatic Updates"
 
-  # Download self-update script and SCP to VM
   SELF_UPDATE_LOCAL="${_WORK_DIR}/self-update.sh"
   curl -fsSL "$SELF_UPDATE_SCRIPT_URL" -o "$SELF_UPDATE_LOCAL" \
     || die "Failed to download self-update.sh"
@@ -704,23 +702,18 @@ if [[ "$VM_ROLE" == "manage" ]]; then
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
-# Install self-update script
 sudo install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
 sudo chown root:root /opt/ridestatus/self-update.sh
 
-# Create log file
 sudo touch /var/log/ridestatus-self-update.log
 sudo chmod 644 /var/log/ridestatus-self-update.log
 
-# Cron job: run self-update every 30 minutes
 echo "*/30 * * * * root /opt/ridestatus/self-update.sh >> /var/log/ridestatus-self-update.log 2>&1" \
   | sudo tee /etc/cron.d/ridestatus-manage-update > /dev/null
 sudo chmod 644 /etc/cron.d/ridestatus-manage-update
 
-# Install unattended-upgrades for automatic OS security patches
 apt-get install -y --no-install-recommends unattended-upgrades update-notifier-common
 
-# Configure unattended-upgrades: security patches only, auto-clean, no auto-reboot
 sudo tee /etc/apt/apt.conf.d/50unattended-upgrades > /dev/null <<'CONF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
@@ -730,7 +723,6 @@ Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
 CONF
 
-# Enable daily auto-upgrade
 sudo tee /etc/apt/apt.conf.d/20auto-upgrades > /dev/null <<'CONF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -769,5 +761,7 @@ if [[ "$VM_ROLE" == "manage" ]]; then
   ok "Management UI: http://${VM_IP}:3000"
   ok "Default login: admin / admin  (change immediately)"
   ok "Self-update: runs every 30 min via cron, or use the Dashboard button"
+  warn "SERVER_URL and SERVER_API_KEY in /opt/ridestatus/.env are blank."
+  warn "Fill them in once the park board server (SCADA 2) is deployed."
 fi
 echo ""
