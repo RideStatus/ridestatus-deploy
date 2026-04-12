@@ -7,22 +7,12 @@
 # Creates RideStatus Server VM and/or Ansible Controller VM.
 #
 # Flow:
-#   1. whiptail TUI collects ALL configuration up front (VMs, NICs, resources,
-#      park settings, GitHub auth, SMTP). Tech can navigate back and change
-#      anything before committing.
-#   2. Configuration is written to /root/ridestatus-deploy-config.json and
-#      also exported as environment variables for the bootstrap scripts.
-#   3. VMs are created and bootstrap scripts run non-interactively.
-#      The only remaining interactive step is displaying the GitHub deploy key
-#      and waiting for the tech to add it — a simple "Press Enter to continue"
-#      that works fine with a direct TTY connection.
+#   1. whiptail TUI collects ALL configuration up front.
+#   2. VMs are created and bootstrap scripts run non-interactively via env vars.
+#   3. The only remaining interactive step is the GitHub deploy key
+#      "Press Enter" — which works reliably since it runs with a direct TTY.
 #
-# TTY approach:
-#   deploy.sh runs directly as root on the Proxmox host — no sudo involved,
-#   full TTY available for whiptail. Bootstrap scripts receive everything via
-#   environment variables, eliminating the sudo+/dev/tty problem entirely.
-#
-# Usage: bash proxmox/deploy.sh
+# Usage: bash /tmp/deploy.sh   (download first, then run — whiptail needs TTY)
 # =============================================================================
 
 set -euo pipefail
@@ -53,7 +43,6 @@ command -v jq        >/dev/null 2>&1 || die "jq not found (apt install jq)"
 
 PROXMOX_NODE=$(hostname)
 ADMIN_KEY_PATH="/root/ridestatus-admin-key"
-CONFIG_FILE="/root/ridestatus-deploy-config.json"
 BOOTSTRAP_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap"
 ANSIBLE_KEY_SERVER_PORT=9876
 
@@ -150,7 +139,6 @@ _detect_usb_nics() {
     USB_NIC_VP["$iface"]="$vp"
   done
 
-  # Mark buses claimed by existing VMs
   mapfile -t VMIDS < <(
     pvesh get "/nodes/${PROXMOX_NODE}/qemu" --output-format json 2>/dev/null \
     | grep -o '"vmid":[0-9]*' | grep -o '[0-9]*' || true
@@ -198,47 +186,40 @@ trap cleanup EXIT
 # =============================================================================
 WT_H=20; WT_W=72
 
-wt_msg()    { whiptail --title "RideStatus Deploy" --msgbox    "$1" $WT_H $WT_W; }
-wt_info()   { whiptail --title "RideStatus Deploy" --infobox   "$1" 8 $WT_W; }
-wt_input()  {
+wt_msg()  { whiptail --title "RideStatus Deploy" --msgbox      "$1" $WT_H $WT_W; }
+wt_input() {
   # wt_input VARNAME "prompt" "default"
   local -n _wi=$1
   _wi=$(whiptail --title "RideStatus Deploy" --inputbox "$2" 10 $WT_W "$3" 3>&1 1>&2 2>&3) || true
-  [[ -z "$_wi" && -n "$3" ]] && _wi="$3"
+  [[ -z "$_wi" && -n "${3:-}" ]] && _wi="$3"
 }
 wt_password() {
   local -n _wp=$1
   _wp=$(whiptail --title "RideStatus Deploy" --passwordbox "$2" 10 $WT_W 3>&1 1>&2 2>&3) || true
 }
-wt_menu()   {
+wt_menu() {
   # wt_menu VARNAME "prompt" item1 desc1 item2 desc2 ...
   local -n _wm=$1; local prompt=$2; shift 2
   _wm=$(whiptail --title "RideStatus Deploy" --menu "$prompt" $WT_H $WT_W 8 "$@" 3>&1 1>&2 2>&3) || true
 }
-wt_yesno()  {
-  # returns 0=yes 1=no
+wt_yesno() {
   whiptail --title "RideStatus Deploy" --yesno "$1" 10 $WT_W
 }
-wt_form()   {
-  # wt_form "prompt" field_name1 default1 field_name2 default2 ...
-  # Outputs newline-separated values
-  local prompt=$1; shift
-  local items=()
-  local i=1
-  while [[ $# -ge 2 ]]; do
-    items+=("$1" "$i" 1 "$2" "$i" 24 44 0)
-    shift 2; (( i++ ))
-  done
-  whiptail --title "RideStatus Deploy" --form "$prompt" $WT_H $WT_W "${#items[@]}" "${items[@]}" 3>&1 1>&2 2>&3 || true
-}
 
 # =============================================================================
-# Screen 1: Welcome + VM selection
+# Welcome
 # =============================================================================
-whiptail --title "RideStatus Deploy" --msgbox \
-"Welcome to RideStatus Proxmox Deploy\n\nHost: ${PROXMOX_NODE}\nStorage: OS=${DISK_STORAGE}  CI=${CI_STORAGE}\n\nThis wizard collects all settings before making any changes.\nUse Tab to navigate, Space/Enter to select." \
-$WT_H $WT_W
+wt_msg "Welcome to RideStatus Proxmox Deploy
 
+Host: ${PROXMOX_NODE}
+Storage: OS=${DISK_STORAGE}  CI=${CI_STORAGE}
+
+This wizard collects all settings before making any changes.
+Use Tab to navigate, Space/Enter to select."
+
+# =============================================================================
+# VM selection
+# =============================================================================
 CREATE_ANSIBLE=false
 CREATE_SERVER=false
 VM_SEL=""
@@ -247,17 +228,14 @@ wt_menu VM_SEL "Which VMs should be created on this host?" \
   "ansible" "Ansible Controller only" \
   "server"  "RideStatus Server only"
 
-[[ "$VM_SEL" == "both"    || "$VM_SEL" == "ansible" ]] && CREATE_ANSIBLE=true
-[[ "$VM_SEL" == "both"    || "$VM_SEL" == "server"  ]] && CREATE_SERVER=true
+[[ "$VM_SEL" == "both" || "$VM_SEL" == "ansible" ]] && CREATE_ANSIBLE=true
+[[ "$VM_SEL" == "both" || "$VM_SEL" == "server"  ]] && CREATE_SERVER=true
 
 # =============================================================================
-# NIC config helper
+# NIC configuration helper
 # =============================================================================
-# Returns via globals: NIC_TYPES NIC_LABELS NIC_BRIDGES NIC_USBS NIC_MACS
-#                      NIC_IPS NIC_GWS NIC_DNSS NIC_DR (default route idx)
 declare -a NIC_TYPES=() NIC_LABELS=() NIC_BRIDGES=() NIC_USBS=()
 declare -a NIC_MACS=() NIC_IPS=() NIC_GWS=() NIC_DNSS=() NIC_DR=()
-
 _session_claimed=()
 
 collect_nics() {
@@ -268,12 +246,10 @@ collect_nics() {
   local nic_num=1
 
   while true; do
-    # --- Label ---
     local net_label=""
-    wt_input net_label "${vm_label} vNIC${nic_num} — Network label (e.g. Ride Control, SFTP, Management):" "Ride Control"
+    wt_input net_label "${vm_label} vNIC${nic_num} — Network label:" "Ride Control"
     [[ -z "$net_label" ]] && net_label="Network ${nic_num}"
 
-    # --- Connection type ---
     local available_usb=()
     for u in "${FREE_USB_NICS[@]:-}"; do
       local skip=false
@@ -283,7 +259,7 @@ collect_nics() {
 
     local nic_type=""
     if [[ ${#available_usb[@]} -gt 0 ]]; then
-      local conn_items=("bridge" "Shared Proxmox bridge (virtio, Proxmox-assigned MAC)")
+      local conn_items=("bridge" "Shared bridge (Proxmox-assigned MAC)")
       for u in "${available_usb[@]}"; do
         conn_items+=("usb:${u}" "USB passthrough: ${u}  MAC=${USB_NIC_MAC[$u]}  bus=${USB_NIC_BUS[$u]}")
       done
@@ -308,12 +284,12 @@ collect_nics() {
         while ip link show "vmbr${next_num}" &>/dev/null 2>&1; do next_num=$(( next_num+1 )); done
         wt_input bridge_name "New bridge name:" "vmbr${next_num}"
         local phys_items=()
-        for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep -Ev '^(lo|vmbr|tap|veth|fwbr|fwpr|fwln)' | grep -v '@'); do
+        for iface in $(ip -o link show | awk -F': ' '{print $2}' \
+            | grep -Ev '^(lo|vmbr|tap|veth|fwbr|fwpr|fwln)' | grep -v '@'); do
           phys_items+=("$iface" "$(cat /sys/class/net/${iface}/address 2>/dev/null || echo unknown)")
         done
         local phys_sel=""
-        wt_menu phys_sel "Select physical NIC for ${bridge_name}:" "${phys_items[@]}"
-        # Create the bridge
+        wt_menu phys_sel "Physical NIC for ${bridge_name}:" "${phys_items[@]}"
         if ! ip link show "$bridge_name" &>/dev/null 2>&1; then
           { echo "auto ${bridge_name}"
             echo "iface ${bridge_name} inet manual"
@@ -328,42 +304,36 @@ collect_nics() {
         bridge_name="$b_sel"
       fi
       nic_mac="virtio"
-
     else
-      # USB passthrough
       usb_iface="${nic_type#usb:}"
       nic_type="usb"
       nic_mac="${USB_NIC_MAC[$usb_iface]:-unknown}"
       _session_claimed+=("$usb_iface")
     fi
 
-    # --- IP ---
     local ip_cidr=""
     while true; do
-      wt_input ip_cidr "${vm_label} vNIC${nic_num} (${net_label}) — Static IP/prefix (e.g. 10.250.5.101/19):" ""
+      wt_input ip_cidr "${vm_label} vNIC${nic_num} (${net_label}) — Static IP/prefix:" ""
       [[ "$ip_cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && break
       wt_msg "Invalid format. Enter IP/prefix like 10.250.5.101/19"
     done
 
-    # --- Default route ---
     local gw="" dns="8.8.8.8" is_dr="no"
     if ! $dr_assigned; then
-      if wt_yesno "Use vNIC${nic_num} (${net_label}, ${ip_cidr}) as the default route for ${vm_label}?\n\nThis NIC carries internet traffic (updates, alerts, weather)."; then
+      if wt_yesno "Use vNIC${nic_num} (${net_label}, ${ip_cidr}) as the default route for ${vm_label}?
+
+This NIC handles internet traffic (updates, alerts, weather)."; then
         is_dr="yes"
         dr_assigned=true
-        wt_input gw "Default gateway for ${vm_label}:" ""
+        wt_input gw "Default gateway:" ""
       fi
     fi
-    wt_input dns "DNS server for vNIC${nic_num} (${net_label}):" "8.8.8.8"
+    wt_input dns "DNS server for vNIC${nic_num}:" "8.8.8.8"
 
-    NIC_TYPES+=("$nic_type")
-    NIC_LABELS+=("$net_label")
-    NIC_BRIDGES+=("$bridge_name")
-    NIC_USBS+=("$usb_iface")
-    NIC_MACS+=("$nic_mac")
-    NIC_IPS+=("$ip_cidr")
-    NIC_GWS+=("$gw")
-    NIC_DNSS+=("$dns")
+    NIC_TYPES+=("$nic_type");   NIC_LABELS+=("$net_label")
+    NIC_BRIDGES+=("$bridge_name"); NIC_USBS+=("$usb_iface")
+    NIC_MACS+=("$nic_mac");     NIC_IPS+=("$ip_cidr")
+    NIC_GWS+=("$gw");           NIC_DNSS+=("$dns")
     NIC_DR+=("$is_dr")
 
     wt_yesno "Add another NIC to ${vm_label}?" || break
@@ -372,46 +342,33 @@ collect_nics() {
 }
 
 # =============================================================================
-# Screen: Ansible VM config
+# Ansible VM config
 # =============================================================================
 ANSIBLE_VMID="" ANSIBLE_RAM="2" ANSIBLE_CORES="2" ANSIBLE_DISK="20" ANSIBLE_HOST="ridestatus-ansible"
 declare -a A_NIC_TYPES=() A_NIC_LABELS=() A_NIC_BRIDGES=() A_NIC_USBS=()
 declare -a A_NIC_MACS=() A_NIC_IPS=() A_NIC_GWS=() A_NIC_DNSS=() A_NIC_DR=()
 
 if $CREATE_ANSIBLE; then
-  # VM ID
   next_vmid=300
   while pvesh get "/nodes/${PROXMOX_NODE}/qemu/${next_vmid}/status" &>/dev/null 2>&1; do
     next_vmid=$(( next_vmid + 1 ))
   done
   wt_input ANSIBLE_VMID "Ansible Controller VM ID:" "$next_vmid"
+  wt_input ANSIBLE_RAM   "Ansible VM RAM (GB):"      "2"
+  wt_input ANSIBLE_CORES "Ansible VM CPU cores:"     "2"
+  wt_input ANSIBLE_DISK  "Ansible VM disk (GB):"     "20"
+  wt_input ANSIBLE_HOST  "Ansible VM hostname:"      "ridestatus-ansible"
 
-  # Resources (form)
-  mapfile -t res_vals < <(wt_form "Ansible Controller — Resources:" \
-    "RAM (GB)" "2" \
-    "CPU cores" "2" \
-    "Disk (GB)" "20" \
-    "Hostname" "ridestatus-ansible")
-  ANSIBLE_RAM="${res_vals[0]:-2}"
-  ANSIBLE_CORES="${res_vals[1]:-2}"
-  ANSIBLE_DISK="${res_vals[2]:-20}"
-  ANSIBLE_HOST="${res_vals[3]:-ridestatus-ansible}"
-
-  # NICs
   collect_nics "Ansible VM"
-  A_NIC_TYPES=("${NIC_TYPES[@]}")
-  A_NIC_LABELS=("${NIC_LABELS[@]}")
-  A_NIC_BRIDGES=("${NIC_BRIDGES[@]}")
-  A_NIC_USBS=("${NIC_USBS[@]}")
-  A_NIC_MACS=("${NIC_MACS[@]}")
-  A_NIC_IPS=("${NIC_IPS[@]}")
-  A_NIC_GWS=("${NIC_GWS[@]}")
-  A_NIC_DNSS=("${NIC_DNSS[@]}")
+  A_NIC_TYPES=("${NIC_TYPES[@]}");   A_NIC_LABELS=("${NIC_LABELS[@]}")
+  A_NIC_BRIDGES=("${NIC_BRIDGES[@]}"); A_NIC_USBS=("${NIC_USBS[@]}")
+  A_NIC_MACS=("${NIC_MACS[@]}");     A_NIC_IPS=("${NIC_IPS[@]}")
+  A_NIC_GWS=("${NIC_GWS[@]}");       A_NIC_DNSS=("${NIC_DNSS[@]}")
   A_NIC_DR=("${NIC_DR[@]}")
 fi
 
 # =============================================================================
-# Screen: Server VM config
+# Server VM config
 # =============================================================================
 SERVER_VMID="" SERVER_RAM="4" SERVER_CORES="2" SERVER_DISK="64" SERVER_HOST="ridestatus-server"
 declare -a S_NIC_TYPES=() S_NIC_LABELS=() S_NIC_BRIDGES=() S_NIC_USBS=()
@@ -423,27 +380,17 @@ if $CREATE_SERVER; then
   while pvesh get "/nodes/${PROXMOX_NODE}/qemu/${next_vmid}/status" &>/dev/null 2>&1; do
     next_vmid=$(( next_vmid + 1 ))
   done
-  wt_input SERVER_VMID "RideStatus Server VM ID:" "$next_vmid"
-
-  mapfile -t res_vals < <(wt_form "RideStatus Server — Resources:" \
-    "RAM (GB)" "4" \
-    "CPU cores" "2" \
-    "Disk (GB)" "64" \
-    "Hostname" "ridestatus-server")
-  SERVER_RAM="${res_vals[0]:-4}"
-  SERVER_CORES="${res_vals[1]:-2}"
-  SERVER_DISK="${res_vals[2]:-64}"
-  SERVER_HOST="${res_vals[3]:-ridestatus-server}"
+  wt_input SERVER_VMID   "RideStatus Server VM ID:"   "$next_vmid"
+  wt_input SERVER_RAM    "Server VM RAM (GB):"         "4"
+  wt_input SERVER_CORES  "Server VM CPU cores:"        "2"
+  wt_input SERVER_DISK   "Server VM disk (GB):"        "64"
+  wt_input SERVER_HOST   "Server VM hostname:"         "ridestatus-server"
 
   collect_nics "Server VM"
-  S_NIC_TYPES=("${NIC_TYPES[@]}")
-  S_NIC_LABELS=("${NIC_LABELS[@]}")
-  S_NIC_BRIDGES=("${NIC_BRIDGES[@]}")
-  S_NIC_USBS=("${NIC_USBS[@]}")
-  S_NIC_MACS=("${NIC_MACS[@]}")
-  S_NIC_IPS=("${NIC_IPS[@]}")
-  S_NIC_GWS=("${NIC_GWS[@]}")
-  S_NIC_DNSS=("${NIC_DNSS[@]}")
+  S_NIC_TYPES=("${NIC_TYPES[@]}");   S_NIC_LABELS=("${NIC_LABELS[@]}")
+  S_NIC_BRIDGES=("${NIC_BRIDGES[@]}"); S_NIC_USBS=("${NIC_USBS[@]}")
+  S_NIC_MACS=("${NIC_MACS[@]}");     S_NIC_IPS=("${NIC_IPS[@]}")
+  S_NIC_GWS=("${NIC_GWS[@]}");       S_NIC_DNSS=("${NIC_DNSS[@]}")
   S_NIC_DR=("${NIC_DR[@]}")
   for i in "${!S_NIC_DR[@]}"; do
     [[ "${S_NIC_DR[$i]}" == "yes" ]] && SERVER_DR_IDX=$i && break
@@ -451,72 +398,53 @@ if $CREATE_SERVER; then
 fi
 
 # =============================================================================
-# Screen: Park configuration (server only)
+# Park configuration (server only)
 # =============================================================================
-PARK_NAME="My Park"
-PARK_TZ="America/Chicago"
-WEATHER_API_KEY=""
-WEATHER_ZIP="00000"
-ALERT_EMAIL=""
-ALERT_SMS=""
-SMTP_HOST=""
-SMTP_PORT="587"
-SMTP_USER=""
-SMTP_PASS=""
+PARK_NAME="My Park" PARK_TZ="America/Chicago"
+WEATHER_API_KEY="" WEATHER_ZIP="00000"
+ALERT_EMAIL="" ALERT_SMS=""
+SMTP_HOST="" SMTP_PORT="587" SMTP_USER="" SMTP_PASS=""
 
 if $CREATE_SERVER; then
-  mapfile -t park_vals < <(wt_form "Park Configuration:" \
-    "Park name" "My Park" \
-    "Timezone" "America/Chicago" \
-    "WeatherAPI.com key (optional)" "" \
-    "Weather ZIP code" "00000" \
-    "Alert email (optional)" "" \
-    "Alert SMS address (optional)" "" \
-    "SMTP host (optional)" "" \
-    "SMTP port" "587" \
-    "SMTP username (optional)" "")
-  PARK_NAME="${park_vals[0]:-My Park}"
-  PARK_TZ="${park_vals[1]:-America/Chicago}"
-  WEATHER_API_KEY="${park_vals[2]:-}"
-  WEATHER_ZIP="${park_vals[3]:-00000}"
-  ALERT_EMAIL="${park_vals[4]:-}"
-  ALERT_SMS="${park_vals[5]:-}"
-  SMTP_HOST="${park_vals[6]:-}"
-  SMTP_PORT="${park_vals[7]:-587}"
-  SMTP_USER="${park_vals[8]:-}"
-
+  wt_input PARK_NAME       "Park name:"                           "My Park"
+  wt_input PARK_TZ         "Timezone (e.g. America/Chicago):"     "America/Chicago"
+  wt_input WEATHER_API_KEY "WeatherAPI.com key (leave blank to skip):" ""
+  wt_input WEATHER_ZIP     "Weather ZIP code:"                    "00000"
+  wt_input ALERT_EMAIL     "Alert email address (optional):"      ""
+  wt_input ALERT_SMS       "Alert SMS address (optional):"        ""
+  wt_input SMTP_HOST       "SMTP host (optional):"                ""
+  wt_input SMTP_PORT       "SMTP port:"                           "587"
+  wt_input SMTP_USER       "SMTP username (optional):"            ""
   if [[ -n "$SMTP_HOST" ]]; then
-    wt_password SMTP_PASS "SMTP password (for ${SMTP_USER:-SMTP}):"
+    wt_password SMTP_PASS "SMTP password:"
   fi
 fi
 
 # =============================================================================
-# Screen: GitHub access method
+# GitHub access
 # =============================================================================
 GITHUB_AUTH_METHOD="deploy_key"
-GITHUB_USER=""
-GITHUB_PAT=""
+GITHUB_USER="" GITHUB_PAT=""
 
 wt_menu GITHUB_AUTH_METHOD "GitHub access for private repos:" \
   "deploy_key" "Deploy key — SSH key scoped to RideStatus repos (recommended)" \
-  "pat"         "Personal access token (PAT) — simpler, enter once"
+  "pat"        "Personal access token (PAT) — simpler, enter once"
 
 if [[ "$GITHUB_AUTH_METHOD" == "pat" ]]; then
-  wt_input GITHUB_USER "GitHub username:" ""
-  wt_password GITHUB_PAT "GitHub PAT (input hidden):"
+  wt_input   GITHUB_USER "GitHub username:" ""
+  wt_password GITHUB_PAT "GitHub PAT:"
 fi
 
 # =============================================================================
-# Screen: Admin SSH key
+# Admin SSH key
 # =============================================================================
-ADMIN_SSH_PUBKEY=""
-ADMIN_GENERATED=false
+ADMIN_SSH_PUBKEY="" ADMIN_GENERATED=false
 
 if [[ -f "${ADMIN_KEY_PATH}.pub" ]]; then
   ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
   wt_msg "Using existing admin SSH key:\n${ADMIN_KEY_PATH}"
 else
-  wt_input ADMIN_SSH_PUBKEY "Paste SSH public key (or leave blank to generate one):" ""
+  wt_input ADMIN_SSH_PUBKEY "Paste SSH public key (leave blank to auto-generate):" ""
   if [[ -z "$ADMIN_SSH_PUBKEY" ]]; then
     ssh-keygen -t ed25519 -f "$ADMIN_KEY_PATH" -N "" -C "ridestatus-admin" -q
     ADMIN_SSH_PUBKEY=$(cat "${ADMIN_KEY_PATH}.pub")
@@ -526,40 +454,34 @@ else
 fi
 
 # =============================================================================
-# Screen: Summary + confirm
+# Summary + confirm
 # =============================================================================
 _summary=""
 if $CREATE_ANSIBLE; then
   _summary+="ANSIBLE CONTROLLER  (VM ${ANSIBLE_VMID})\n"
-  _summary+="  Host: ${ANSIBLE_HOST}  RAM: ${ANSIBLE_RAM}GB  Cores: ${ANSIBLE_CORES}  Disk: ${ANSIBLE_DISK}GB\n"
+  _summary+="  ${ANSIBLE_HOST}  RAM:${ANSIBLE_RAM}GB  CPU:${ANSIBLE_CORES}  Disk:${ANSIBLE_DISK}GB\n"
   for i in "${!A_NIC_TYPES[@]}"; do
-    local _conn
-    if [[ "${A_NIC_TYPES[$i]}" == "bridge" ]]; then
-      _conn="bridge=${A_NIC_BRIDGES[$i]}"
-    else
-      _conn="USB=${A_NIC_USBS[$i]} (${USB_NIC_BUS[${A_NIC_USBS[$i]}]:-?})"
-    fi
-    local _dr=""; [[ "${A_NIC_DR[$i]}" == "yes" ]] && _dr=" [GW]"
-    _summary+="  vNIC$((i+1)): ${A_NIC_LABELS[$i]}  ${A_NIC_IPS[$i]}  ${_conn}${_dr}\n"
+    local _c _d=""
+    [[ "${A_NIC_TYPES[$i]}" == "bridge" ]] && _c="bridge=${A_NIC_BRIDGES[$i]}" \
+      || _c="USB=${A_NIC_USBS[$i]}(${USB_NIC_BUS[${A_NIC_USBS[$i]}]:-?})"
+    [[ "${A_NIC_DR[$i]}" == "yes" ]] && _d=" [GW=${A_NIC_GWS[$i]}]"
+    _summary+="  vNIC$((i+1)): ${A_NIC_LABELS[$i]}  ${A_NIC_IPS[$i]}  ${_c}${_d}\n"
   done
   _summary+="\n"
 fi
 if $CREATE_SERVER; then
   _summary+="RIDESTATUS SERVER  (VM ${SERVER_VMID})\n"
-  _summary+="  Host: ${SERVER_HOST}  RAM: ${SERVER_RAM}GB  Cores: ${SERVER_CORES}  Disk: ${SERVER_DISK}GB\n"
+  _summary+="  ${SERVER_HOST}  RAM:${SERVER_RAM}GB  CPU:${SERVER_CORES}  Disk:${SERVER_DISK}GB\n"
   for i in "${!S_NIC_TYPES[@]}"; do
-    local _conn
-    if [[ "${S_NIC_TYPES[$i]}" == "bridge" ]]; then
-      _conn="bridge=${S_NIC_BRIDGES[$i]}"
-    else
-      _conn="USB=${S_NIC_USBS[$i]} (${USB_NIC_BUS[${S_NIC_USBS[$i]}]:-?})"
-    fi
-    local _dr=""; [[ "${S_NIC_DR[$i]}" == "yes" ]] && _dr=" [GW]"
-    _summary+="  vNIC$((i+1)): ${S_NIC_LABELS[$i]}  ${S_NIC_IPS[$i]}  ${_conn}${_dr}\n"
+    local _c _d=""
+    [[ "${S_NIC_TYPES[$i]}" == "bridge" ]] && _c="bridge=${S_NIC_BRIDGES[$i]}" \
+      || _c="USB=${S_NIC_USBS[$i]}(${USB_NIC_BUS[${S_NIC_USBS[$i]}]:-?})"
+    [[ "${S_NIC_DR[$i]}" == "yes" ]] && _d=" [GW=${S_NIC_GWS[$i]}]"
+    _summary+="  vNIC$((i+1)): ${S_NIC_LABELS[$i]}  ${S_NIC_IPS[$i]}  ${_c}${_d}\n"
   done
   _summary+="  Park: ${PARK_NAME}  TZ: ${PARK_TZ}\n\n"
 fi
-_summary+="GitHub auth: ${GITHUB_AUTH_METHOD}\n"
+_summary+="GitHub: ${GITHUB_AUTH_METHOD}\n"
 _summary+="Storage: OS=${DISK_STORAGE}  CI=${CI_STORAGE}"
 
 wt_yesno "Review configuration:\n\n${_summary}\n\nProceed with deployment?" \
@@ -583,7 +505,8 @@ deploy_ssh() {
     opts+=(-t -t)
     ssh -i "$DEPLOY_KEY" "${opts[@]}" "ridestatus@${ip}" "$@"
     local rc=$?
-    [[ $rc -eq 255 && -f "$ADMIN_KEY_PATH" ]] && ssh -i "$ADMIN_KEY_PATH" "${opts[@]}" "ridestatus@${ip}" "$@" && return
+    [[ $rc -eq 255 && -f "$ADMIN_KEY_PATH" ]] && \
+      ssh -i "$ADMIN_KEY_PATH" "${opts[@]}" "ridestatus@${ip}" "$@"
     return $rc
   else
     opts+=(-o BatchMode=yes)
@@ -741,9 +664,7 @@ fix_usb_nic_names() {
     [[ "${fnn_type[$i]}" != "usb" ]] && continue
     local hm; hm=$(iface_mac "${fnn_usb[$i]}" | tr '[:upper:]' '[:lower:]')
     local rn="${ga_map[$hm]:-}" ph="usb-placeholder-${usb_slot}"
-    if [[ -n "$rn" && "$rn" != "$ph" ]]; then
-      real_names["$ph"]="$rn"; needs_fix=true
-    fi
+    if [[ -n "$rn" && "$rn" != "$ph" ]]; then real_names["$ph"]="$rn"; needs_fix=true; fi
     usb_slot=$(( usb_slot+1 ))
   done
 
@@ -769,103 +690,94 @@ fix_usb_nic_names() {
 
 # =============================================================================
 # Bootstrap runner
-# Downloads script + env file in one non-interactive SSH call, then executes
-# with a fresh TTY SSH so sudo bash is the direct top-level command.
+# Step 1: download script non-interactively
+# Step 2: write env file
+# Step 3: execute with TTY — sudo bash as direct SSH command (no wrapper shell)
 # =============================================================================
 run_bootstrap() {
-  local ip=$1 script=$2 env_vars=$3
+  local ip=$1 script=$2 env_vars=${3:-}
   info "Running ${script} on ${ip}..."
 
-  # Build the env file content
   local remote_script="/tmp/ridestatus-bs-$$.sh"
   local remote_env="/tmp/ridestatus-env-$$.sh"
 
-  # Step 1: download script
   deploy_ssh "$ip" \
-    "curl -fsSL -H 'Cache-Control: no-cache' '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) -o '${remote_script}'" \
+    "curl -fsSL -H 'Cache-Control: no-cache' \
+      '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) -o '${remote_script}'" \
     || { err "Failed to download ${script}"; return 1; }
 
-  # Step 2: write env file
   if [[ -n "$env_vars" ]]; then
-    # env_vars is newline-separated KEY=VALUE pairs
     local env_content
-    env_content=$(echo "$env_vars" | sed "s/^/export /")
-    deploy_ssh "$ip" "cat > '${remote_env}' << 'RSEOF'
-${env_content}
-RSEOF" || true
+    env_content=$(printf '%s\n' "$env_vars" | sed 's/^/export /')
+    deploy_ssh "$ip" "printf '%s\n' $(printf '%q' "$env_content") > '${remote_env}'" || true
   fi
 
-  # Step 3: TTY SSH — sudo bash as the direct SSH command (not wrapped in shell)
-  # This is the key: passing args as separate words to ssh, not a single string,
-  # so sudo bash gets the controlling terminal directly.
   if [[ -n "$env_vars" ]]; then
-    deploy_ssh -t "$ip" sudo bash -c \". '${remote_env}' && bash '${remote_script}'; rm -f '${remote_script}' '${remote_env}'"
+    deploy_ssh -t "$ip" sudo bash -c \
+      ". '${remote_env}' && bash '${remote_script}'; rm -f '${remote_script}' '${remote_env}'"
   else
-    deploy_ssh -t "$ip" sudo bash "'${remote_script}'"
+    deploy_ssh -t "$ip" sudo bash "${remote_script}"
   fi
   local rc=$?
 
+  deploy_ssh "$ip" "rm -f '${remote_script}' '${remote_env}'" 2>/dev/null || true
+
   if [[ $rc -ne 0 ]]; then
-    echo ""
     err "Bootstrap failed for ${script} on ${ip} (exit ${rc})"
-    err "Retry manually: ssh ridestatus@${ip}"
-    err "  sudo bash ${remote_script}"
+    err "Retry: ssh ridestatus@${ip}  then  sudo bash ${remote_script}"
     return 1
   fi
-
-  # Cleanup remote temp files
-  deploy_ssh "$ip" "rm -f '${remote_script}' '${remote_env}'" 2>/dev/null || true
   ok "${script} completed on ${ip}"
 }
 
 # =============================================================================
-# Build env var strings for bootstrap scripts
+# Build env strings for bootstrap scripts
 # =============================================================================
 _build_ansible_env() {
   local extra="${1:-}"
-  local env=""
-  env+="RS_GITHUB_AUTH=${GITHUB_AUTH_METHOD}\n"
-  [[ "$GITHUB_AUTH_METHOD" == "pat" ]] && \
-    env+="RS_GITHUB_USER=${GITHUB_USER}\nRS_GITHUB_PAT=${GITHUB_PAT}\n"
-  [[ -n "$extra" ]] && env+="${extra}\n"
-  printf '%b' "$env"
+  local env="RS_GITHUB_AUTH=${GITHUB_AUTH_METHOD}"
+  if [[ "$GITHUB_AUTH_METHOD" == "pat" ]]; then
+    env+=$'\n'"RS_GITHUB_USER=${GITHUB_USER}"
+    env+=$'\n'"RS_GITHUB_PAT=${GITHUB_PAT}"
+  fi
+  [[ -n "$extra" ]] && env+=$'\n'"${extra}"
+  echo "$env"
 }
 
 _build_server_env() {
   local extra="${1:-}"
-  # Generate secrets on Proxmox host so they're consistent across re-runs
   local api_key bootstrap_token
   api_key=$(python3 -c "import secrets; print(secrets.token_hex(32))")
-  bootstrap_token=$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_uppercase+string.digits) for _ in range(8)))")
+  bootstrap_token=$(python3 -c "import secrets,string; \
+    print(''.join(secrets.choice(string.ascii_uppercase+string.digits) for _ in range(8)))")
 
   local dr_iface="ens18"
-  if [[ $SERVER_DR_IDX -ge 0 ]]; then
-    dr_iface="net${SERVER_DR_IDX}"
-  fi
+  [[ $SERVER_DR_IDX -ge 0 ]] && dr_iface="net${SERVER_DR_IDX}"
 
-  local env=""
-  env+="RS_GITHUB_AUTH=${GITHUB_AUTH_METHOD}\n"
-  [[ "$GITHUB_AUTH_METHOD" == "pat" ]] && \
-    env+="RS_GITHUB_USER=${GITHUB_USER}\nRS_GITHUB_PAT=${GITHUB_PAT}\n"
-  env+="RS_PARK_NAME=$(printf '%q' "${PARK_NAME}")\n"
-  env+="RS_PARK_TZ=${PARK_TZ}\n"
-  env+="RS_API_KEY=${api_key}\n"
-  env+="RS_BOOTSTRAP_TOKEN=${bootstrap_token}\n"
-  env+="RS_WEATHER_API_KEY=${WEATHER_API_KEY}\n"
-  env+="RS_WEATHER_ZIP=${WEATHER_ZIP}\n"
-  env+="RS_ALERT_EMAIL=${ALERT_EMAIL}\n"
-  env+="RS_ALERT_SMS=${ALERT_SMS}\n"
-  env+="RS_SMTP_HOST=${SMTP_HOST}\n"
-  env+="RS_SMTP_PORT=${SMTP_PORT}\n"
-  env+="RS_SMTP_USER=${SMTP_USER}\n"
-  env+="RS_SMTP_PASS=$(printf '%q' "${SMTP_PASS}")\n"
-  env+="RS_DEFAULT_ROUTE_IFACE=${dr_iface}\n"
-  [[ -n "$extra" ]] && env+="${extra}\n"
-  printf '%b' "$env"
+  local env="RS_GITHUB_AUTH=${GITHUB_AUTH_METHOD}"
+  if [[ "$GITHUB_AUTH_METHOD" == "pat" ]]; then
+    env+=$'\n'"RS_GITHUB_USER=${GITHUB_USER}"
+    env+=$'\n'"RS_GITHUB_PAT=${GITHUB_PAT}"
+  fi
+  env+=$'\n'"RS_PARK_NAME=${PARK_NAME}"
+  env+=$'\n'"RS_PARK_TZ=${PARK_TZ}"
+  env+=$'\n'"RS_API_KEY=${api_key}"
+  env+=$'\n'"RS_BOOTSTRAP_TOKEN=${bootstrap_token}"
+  env+=$'\n'"RS_WEATHER_API_KEY=${WEATHER_API_KEY}"
+  env+=$'\n'"RS_WEATHER_ZIP=${WEATHER_ZIP}"
+  env+=$'\n'"RS_ALERT_EMAIL=${ALERT_EMAIL}"
+  env+=$'\n'"RS_ALERT_SMS=${ALERT_SMS}"
+  env+=$'\n'"RS_SMTP_HOST=${SMTP_HOST}"
+  env+=$'\n'"RS_SMTP_PORT=${SMTP_PORT}"
+  env+=$'\n'"RS_SMTP_USER=${SMTP_USER}"
+  env+=$'\n'"RS_SMTP_PASS=${SMTP_PASS}"
+  env+=$'\n'"RS_DEFAULT_ROUTE_IFACE=${dr_iface}"
+  [[ -n "$extra" ]] && env+=$'\n'"${extra}"
+  echo "$env"
 }
 
 # =============================================================================
-# Execute: create VMs
+# Create VMs
 # =============================================================================
 header "Creating VMs"
 ensure_ubuntu_image
@@ -888,9 +800,7 @@ if $CREATE_SERVER; then
   ok "VM ${SERVER_VMID} started"
 fi
 
-# Wait for VMs, fix NIC names, wait for SSH
-ANSIBLE_IP=""
-SERVER_IP=""
+ANSIBLE_IP="" SERVER_IP=""
 
 if $CREATE_ANSIBLE; then
   wait_for_agent "$ANSIBLE_VMID"
@@ -907,16 +817,17 @@ if $CREATE_SERVER; then
 fi
 
 # =============================================================================
-# Execute: bootstrap
+# Bootstrap
 # =============================================================================
 if $CREATE_ANSIBLE && $CREATE_SERVER; then
   local ansible_key_url="http://${ANSIBLE_IP}:${ANSIBLE_KEY_SERVER_PORT}/ansible_ridestatus.pub"
   local server_env
-  server_env=$(_build_server_env "RS_ANSIBLE_KEY_URL=${ansible_key_url}\nRS_ANSIBLE_VM_HOST=${ANSIBLE_IP}")
+  server_env=$(_build_server_env \
+    "RS_ANSIBLE_KEY_URL=${ansible_key_url}"$'\n'"RS_ANSIBLE_VM_HOST=${ANSIBLE_IP}")
   local ansible_env
   ansible_env=$(_build_ansible_env)
 
-  info "Starting server.sh in background (waiting for Ansible key)..."
+  info "Starting server.sh in background..."
   ( run_bootstrap "$SERVER_IP" "server.sh" "$server_env" || true ) &
   SERVER_BS_PID=$!
   run_bootstrap "$ANSIBLE_IP" "ansible.sh" "$ansible_env" || true
