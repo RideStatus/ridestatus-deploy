@@ -10,15 +10,9 @@
 #   RS_GITHUB_USER      — GitHub username (PAT mode only)
 #   RS_GITHUB_PAT       — GitHub PAT (PAT mode only)
 #
-# The only interactive step is displaying the GitHub deploy key and waiting
-# for the tech to add it to GitHub. This works correctly because:
-#   - deploy.sh runs this as the direct SSH command (sudo bash /tmp/script.sh)
-#     with -t -t so the PTY is passed through sudo
-#   - When run manually the tech already has a real terminal
-#
 # Usage:
-#   sudo bash /path/to/ansible.sh          # called by deploy.sh
-#   sudo bash ansible.sh                   # manual re-run
+#   sudo RS_GITHUB_AUTH=deploy_key bash /tmp/ansible.sh    # called by deploy.sh
+#   sudo bash ansible.sh                                    # manual re-run
 # =============================================================================
 
 set -euo pipefail
@@ -172,14 +166,12 @@ if [[ "$GITHUB_CREDS_OK" == "false" ]]; then
     echo ""
     echo -e "${BOLD}  Add to each repo listed below (read-only, no write access needed):${RESET}"
     for repo in "${PRIVATE_REPOS[@]}"; do
-      local repo_name; repo_name=$(basename "$repo" .git)
+      repo_name=$(basename "$repo" .git)
       echo "    https://github.com/RideStatus/${repo_name}/settings/keys"
     done
     echo ""
     echo -e "${BOLD}  Steps: Settings → Deploy keys → Add deploy key → paste key → Allow write access: NO${RESET}"
     echo ""
-    # This read works because deploy.sh passes the TTY through with -t -t,
-    # and the script is the direct sudo bash command (not wrapped in a shell).
     read -rp "$(echo -e "${BOLD}Press Enter once the deploy key has been added to GitHub...${RESET}")"
 
     # Write SSH config
@@ -201,7 +193,7 @@ EOF
     # Test
     info "Testing deploy key access..."
     for repo in "${PRIVATE_REPOS[@]}"; do
-      local repo_name; repo_name=$(basename "$repo" .git)
+      repo_name=$(basename "$repo" .git)
       if as_rs "git ls-remote '${repo}' HEAD" &>/dev/null; then
         ok "  ✓ ${repo_name}"
       else
@@ -226,7 +218,7 @@ EOF
 
       info "Testing PAT access..."
       for repo in "${PRIVATE_REPOS[@]}"; do
-        local https_url="https://github.com/RideStatus/$(basename "$repo" .git).git"
+        https_url="https://github.com/RideStatus/$(basename "$repo" .git).git"
         if as_rs "git ls-remote '${https_url}' HEAD" &>/dev/null; then
           ok "  ✓ $(basename "$repo" .git)"
         else
