@@ -100,12 +100,10 @@ else
     die "No token entered. Exiting."
   fi
 
-  # Validate it looks like a PAT
   if [[ ! "$GITHUB_TOKEN" =~ ^gh[ps]_[A-Za-z0-9]+ ]]; then
     warn "Token doesn't look like a GitHub PAT (expected ghp_ or ghs_ prefix). Continuing anyway."
   fi
 
-  # Save for future runs
   mkdir -p "$(dirname "$GHCR_TOKEN_FILE")"
   echo "$GITHUB_TOKEN" > "$GHCR_TOKEN_FILE"
   chmod 600 "$GHCR_TOKEN_FILE"
@@ -634,7 +632,7 @@ wait_ssh "$VM_IP"
 # Install Docker
 # =============================================================================
 header "Installing Docker"
-rssh_tty "$VM_IP" "bash -s" <<'DOCKER_INSTALL'
+rssh_tty "$VM_IP" "sudo bash -s" <<'DOCKER_INSTALL'
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -757,23 +755,23 @@ if [[ "$VM_ROLE" == "manage" ]]; then
     || die "Failed to download self-update.sh"
   rscp "$SELF_UPDATE_LOCAL" "$VM_IP" "/tmp/self-update.sh"
 
-  rssh_tty "$VM_IP" "bash -s" <<'AUTO_UPDATE'
+  rssh_tty "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
-sudo install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
-sudo chown root:root /opt/ridestatus/self-update.sh
+install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
+chown root:root /opt/ridestatus/self-update.sh
 
-sudo touch /var/log/ridestatus-self-update.log
-sudo chmod 644 /var/log/ridestatus-self-update.log
+touch /var/log/ridestatus-self-update.log
+chmod 644 /var/log/ridestatus-self-update.log
 
 echo "*/30 * * * * root /opt/ridestatus/self-update.sh >> /var/log/ridestatus-self-update.log 2>&1" \
-  | sudo tee /etc/cron.d/ridestatus-manage-update > /dev/null
-sudo chmod 644 /etc/cron.d/ridestatus-manage-update
+  > /etc/cron.d/ridestatus-manage-update
+chmod 644 /etc/cron.d/ridestatus-manage-update
 
 apt-get install -y --no-install-recommends unattended-upgrades update-notifier-common
 
-sudo tee /etc/apt/apt.conf.d/50unattended-upgrades > /dev/null <<'CONF'
+tee /etc/apt/apt.conf.d/50unattended-upgrades > /dev/null <<'CONF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
 };
@@ -782,13 +780,13 @@ Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
 CONF
 
-sudo tee /etc/apt/apt.conf.d/20auto-upgrades > /dev/null <<'CONF'
+tee /etc/apt/apt.conf.d/20auto-upgrades > /dev/null <<'CONF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 CONF
 
-sudo systemctl enable --now unattended-upgrades
+systemctl enable --now unattended-upgrades
 echo "Automatic updates configured"
 AUTO_UPDATE
   ok "Self-update cron installed (every 30 min)"
