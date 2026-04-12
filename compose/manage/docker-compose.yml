@@ -1,6 +1,4 @@
 # ridestatus-manage docker-compose.yml
-# Full definition lives in ridestatus-manage repo.
-# This file will be replaced once ridestatus-manage is built.
 services:
   backend:
     image: ghcr.io/ridestatus/ridestatus-manage:latest
@@ -14,6 +12,7 @@ services:
     volumes:
       - manage_data:/data
       - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/ridestatus:/opt/ridestatus
 
   postgres:
     image: postgres:16-alpine
