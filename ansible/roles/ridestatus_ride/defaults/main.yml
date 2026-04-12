@@ -1,6 +1,0 @@
----
-# Role defaults — lowest precedence, overridden by group_vars/host_vars.
-# These mirror the edge_nodes group_vars defaults for standalone role use.
-rs_update_env:   true
-rs_pull_code:    true
-rs_restart_pm2:  true
