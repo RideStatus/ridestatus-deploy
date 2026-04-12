@@ -48,7 +48,6 @@ ANSIBLE_KEY_SERVER_PORT=9876
 
 # Temp file for dialog output — avoids $() subshell which loses the TTY
 _DLG_TMP=$(mktemp /tmp/ridestatus-dlg-XXXXXX)
-trap 'rm -f "$_DLG_TMP"' EXIT
 
 # =============================================================================
 # dialog helpers
@@ -485,7 +484,7 @@ if $CREATE_ANSIBLE; then
   _summary+="ANSIBLE CONTROLLER  (VM ${ANSIBLE_VMID})\n"
   _summary+="  ${ANSIBLE_HOST}  RAM:${ANSIBLE_RAM}GB  CPU:${ANSIBLE_CORES}  Disk:${ANSIBLE_DISK}GB\n"
   for i in "${!A_NIC_TYPES[@]}"; do
-    local _c _d=""
+    _c="" _d=""
     [[ "${A_NIC_TYPES[$i]}" == "bridge" ]] && _c="bridge=${A_NIC_BRIDGES[$i]}" \
       || _c="USB=${A_NIC_USBS[$i]}(${USB_NIC_BUS[${A_NIC_USBS[$i]}]:-?})"
     [[ "${A_NIC_DR[$i]}" == "yes" ]] && _d=" [GW=${A_NIC_GWS[$i]}]"
@@ -497,7 +496,7 @@ if $CREATE_SERVER; then
   _summary+="RIDESTATUS SERVER  (VM ${SERVER_VMID})\n"
   _summary+="  ${SERVER_HOST}  RAM:${SERVER_RAM}GB  CPU:${SERVER_CORES}  Disk:${SERVER_DISK}GB\n"
   for i in "${!S_NIC_TYPES[@]}"; do
-    local _c _d=""
+    _c="" _d=""
     [[ "${S_NIC_TYPES[$i]}" == "bridge" ]] && _c="bridge=${S_NIC_BRIDGES[$i]}" \
       || _c="USB=${S_NIC_USBS[$i]}(${USB_NIC_BUS[${S_NIC_USBS[$i]}]:-?})"
     [[ "${S_NIC_DR[$i]}" == "yes" ]] && _d=" [GW=${S_NIC_GWS[$i]}]"
@@ -842,11 +841,11 @@ fi
 # Bootstrap
 # =============================================================================
 if $CREATE_ANSIBLE && $CREATE_SERVER; then
-  local ansible_key_url="http://${ANSIBLE_IP}:${ANSIBLE_KEY_SERVER_PORT}/ansible_ridestatus.pub"
-  local server_env
+  ansible_key_url="http://${ANSIBLE_IP}:${ANSIBLE_KEY_SERVER_PORT}/ansible_ridestatus.pub"
+  server_env=""
   server_env=$(_build_server_env \
     "RS_ANSIBLE_KEY_URL=${ansible_key_url}"$'\n'"RS_ANSIBLE_VM_HOST=${ANSIBLE_IP}")
-  local ansible_env
+  ansible_env=""
   ansible_env=$(_build_ansible_env)
 
   info "Starting server.sh in background..."
