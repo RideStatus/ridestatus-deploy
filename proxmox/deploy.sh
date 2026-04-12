@@ -31,10 +31,12 @@
 #   Any USB passthrough NIC netplan placeholders are patched in-place.
 #
 # Bootstrap script delivery:
-#   Bootstrap scripts are downloaded to a temp file on the remote VM before
-#   execution. This keeps stdin free for interactive prompts (/dev/tty reads)
-#   and avoids the pipe-to-sudo TTY issue where sudo may reject or misbehave
-#   when its script arrives on stdin, even with NOPASSWD and -t -t SSH flags.
+#   1. Script is downloaded to /tmp on the remote VM (non-interactive SSH).
+#   2. An env-file is written with any required variables.
+#   3. Script is executed via a fresh TTY SSH session as the direct command
+#      ("sudo bash /tmp/script.sh") — NOT wrapped in an outer shell.
+#      This preserves the controlling terminal through sudo, allowing
+#      interactive prompts to work correctly.
 #
 # NIC configuration:
 #   Each vNIC has two properties:
@@ -296,17 +298,13 @@ trap cleanup EXIT
 
 # deploy_ssh [-t] IP [CMD...]
 # Tries the temporary deploy key first; falls back to the admin key ONLY on
-# SSH authentication failure (exit code 255). Remote script errors (any other
-# non-zero exit) are returned as-is without retrying — this prevents bootstrap
-# scripts from running twice when a script fails partway through.
+# SSH authentication failure (exit code 255).
 #
-# Pass -t as the first argument to allocate a pseudo-TTY for the remote
-# session. This is required when the remote script uses /dev/tty for
-# interactive prompts. Double -t forces TTY allocation even when deploy.sh
-# itself has no TTY (e.g. when run via bash <(curl ...)).
+# In TTY mode (-t): allocates a pseudo-TTY with -t -t so sudo inside the
+# remote command retains the controlling terminal for interactive prompts.
+# Stderr is NOT suppressed so all output reaches the terminal.
 #
-# In TTY mode stderr is NOT suppressed so interactive output and error
-# messages reach the terminal.
+# In non-TTY mode: BatchMode=yes, stderr suppressed, silent fallback.
 deploy_ssh() {
   local tty_flag=false
   if [[ "${1:-}" == "-t" ]]; then
@@ -320,9 +318,7 @@ deploy_ssh() {
     -o ConnectTimeout=5
   )
   if $tty_flag; then
-    # -t -t: force TTY even when local stdin is not a TTY (bash <(curl ...))
     ssh_opts+=(-t -t)
-    # Do NOT suppress stderr in TTY mode — interactive output must reach terminal
     ssh -i "$DEPLOY_KEY" "${ssh_opts[@]}" "ridestatus@${ip}" "$@"
     local exit_code=$?
     if [[ $exit_code -eq 255 ]] && [[ -f "$ADMIN_KEY_PATH" ]]; then
@@ -409,11 +405,6 @@ for iface in "${ALL_IFACES[@]}"; do
   USB_NIC_VENDOR_PRODUCT["$iface"]="$vp"
   USB_NIC_MAC["$iface"]=$(iface_mac "$iface")
 
-  # Extract USB bus path (e.g. "4-2") from the usbN/ segment of the sysfs path.
-  # Sysfs paths route through PCI before USB on modern kernels, so the port path
-  # is NOT immediately after /devices/. Example path:
-  #   /sys/devices/pci0000:00/0000:00:08.1/0000:2d:00.3/usb4/4-2/4-2:2.0
-  # The regex matches "4-2" by looking after the usbN/ component.
   bus_path=$(echo "$syspath" | grep -oP 'usb\d+/\K[\d]+-[\d.]+(?=/)' | head -1 || true)
   [[ -n "$bus_path" ]] && USB_NIC_BUS_PATH["$iface"]="$bus_path"
 done
@@ -1024,10 +1015,12 @@ wait_for_ssh() {
 }
 
 # =============================================================================
-# Helper: run bootstrap script in a VM via TTY SSH
+# Helper: run bootstrap script in a VM
 #
-# Downloads the script to a temp file on the remote VM, then executes it.
-# Stderr is NOT suppressed in TTY mode so all output reaches the terminal.
+# Step 1 (non-interactive): download script + write env file to VM
+# Step 2 (TTY): execute "sudo bash /tmp/script.sh" as the direct SSH command
+#               — NOT wrapped in an outer shell. This preserves the PTY
+#               through sudo so interactive prompts work.
 # =============================================================================
 BOOTSTRAP_BASE_URL="https://raw.githubusercontent.com/RideStatus/ridestatus-deploy/main/bootstrap"
 ANSIBLE_KEY_SERVER_PORT=9876
@@ -1035,22 +1028,39 @@ ANSIBLE_KEY_SERVER_PORT=9876
 run_bootstrap() {
   local ip=$1 script=$2 extra_env=${3:-}
   info "Running ${script} on ${ip}..."
-  local env_export=""
-  [[ -n "$extra_env" ]] && env_export="export ${extra_env}; "
-  deploy_ssh -t "$ip" "
-    set -e
-    _rs_tmp=\$(mktemp /tmp/ridestatus-bootstrap-XXXXXX.sh)
-    curl -fsSL -H 'Cache-Control: no-cache' \
-      '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) -o \"\$_rs_tmp\"
-    ${env_export}sudo -E bash \"\$_rs_tmp\"
-    rm -f \"\$_rs_tmp\"
-  " || {
+
+  # Step 1: download script and write env file (no TTY needed)
+  local remote_script="/tmp/ridestatus-bootstrap-$$.sh"
+  local remote_env="/tmp/ridestatus-env-$$.sh"
+
+  deploy_ssh "$ip" "curl -fsSL -H 'Cache-Control: no-cache' \
+    '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) -o '${remote_script}' && \
+    chmod +x '${remote_script}'" || {
+    err "Failed to download ${script} to ${ip}"
+    return 1
+  }
+
+  # Write env file if needed
+  if [[ -n "$extra_env" ]]; then
+    deploy_ssh "$ip" "printf '%s\n' $(printf '%q' "export ${extra_env}") > '${remote_env}'" || true
+  fi
+
+  # Step 2: execute with TTY — sudo bash as the direct SSH command (no wrapper shell)
+  # This keeps the PTY alive through sudo so /dev/tty works in the script.
+  if [[ -n "$extra_env" ]]; then
+    deploy_ssh -t "$ip" "sudo bash -c '. ${remote_env} && bash ${remote_script}; rm -f ${remote_script} ${remote_env}'"
+  else
+    deploy_ssh -t "$ip" "sudo bash ${remote_script}; rm -f ${remote_script}"
+  fi
+  local exit_code=$?
+
+  if [[ $exit_code -ne 0 ]]; then
     echo ""
     err "Bootstrap failed for ${script} on ${ip}."
     err "To retry: ssh ridestatus@${ip}"
     err "  curl -fsSL -H 'Cache-Control: no-cache' '${BOOTSTRAP_BASE_URL}/${script}?'\$(date +%s) -o /tmp/rs.sh && sudo bash /tmp/rs.sh"
     return 1
-  }
+  fi
   ok "${script} completed on ${ip}"
 }
 
