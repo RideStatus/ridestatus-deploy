@@ -1,35 +1,33 @@
-# ridestatus-manage docker-compose.yml
 services:
   backend:
-    image: ghcr.io/ridestatus/ridestatus-manage:latest
+    image: ${MANAGE_IMAGE:-ghcr.io/ridestatus/ridestatus-manage:latest}
     restart: unless-stopped
+    env_file: .env
     ports:
       - "3000:3000"
-    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # pid: host gives access to /proc/1/ns/net so nsenter can run nmap
+    # in the host network namespace and see MAC addresses on the physical NIC
+    pid: host
     depends_on:
       postgres:
         condition: service_healthy
-    volumes:
-      - manage_data:/data
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/ridestatus:/opt/ridestatus
 
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
-    env_file: .env
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB:-ridestatus_manage}
+      POSTGRES_USER:     ${POSTGRES_USER:-ridestatus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ridestatus}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
 volumes:
-  manage_data:
-  postgres_data:
+  pgdata:
