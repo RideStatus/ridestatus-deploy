@@ -7,8 +7,7 @@ services:
       - "3000:3000"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    # pid: host gives access to /proc/1/ns/net so nsenter can run nmap
-    # in the host network namespace and see MAC addresses on the physical NIC
+      - /home/ridestatus/.ssh:/home/ridestatus/.ssh:ro
     pid: host
     depends_on:
       postgres:
