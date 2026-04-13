@@ -361,14 +361,14 @@ wait_agent() {
 
 wait_http() {
   local url=$1 elapsed=0
-  info "Waiting for dashboard at ${url}..."
+  info "Waiting for service at ${url}..."
   while (( elapsed < 300 )); do
     if curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null | grep -q "^[23]"; then
-      echo ""; ok "Dashboard is up"; return 0
+      echo ""; ok "Service is up"; return 0
     fi
     sleep 5; elapsed=$(( elapsed+5 )); echo -n "."
   done
-  echo ""; warn "Dashboard did not respond within 5 minutes — check container logs"
+  echo ""; warn "Service did not respond within 5 minutes — check container logs"
 }
 
 purge_known_host() {
@@ -701,6 +701,9 @@ fi
 
 # =============================================================================
 # Write .env file locally then SCP it
+# Port assignments:
+#   manage: PORT=3000  (ridestatus-manage listens on 3000)
+#   server: API_PORT=3100  (ridestatus-server listens on 3100)
 # =============================================================================
 header "Deploying ${VM_ROLE}"
 
@@ -734,12 +737,12 @@ ENV
     PG_PASS=$(python3 -c "import secrets; print(secrets.token_hex(16))")
     cat > "$ENV_FILE" <<ENV
 NODE_ENV=production
-PORT=3000
+API_PORT=3100
 POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 POSTGRES_DB=ridestatus
 POSTGRES_USER=ridestatus
-POSTGRES_PASSWORD=${PG_PASS}
+POSTGRES_PASS=${PG_PASS}
 API_KEY=${API_KEY}
 BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN}
 PARK_NAME=${PARK_NAME}
@@ -834,9 +837,13 @@ AUTO_UPDATE
 fi
 
 # =============================================================================
-# Wait for dashboard to respond
+# Wait for service to respond
+# manage listens on 3000, server listens on 3100
 # =============================================================================
-wait_http "http://${VM_IP}:3000"
+case "$VM_ROLE" in
+  manage) wait_http "http://${VM_IP}:3000" ;;
+  server) wait_http "http://${VM_IP}:3100" ;;
+esac
 
 # =============================================================================
 # Done
@@ -852,7 +859,7 @@ if $ADMIN_GENERATED; then
 fi
 
 if [[ "$VM_ROLE" == "server" ]]; then
-  ok "Park board:      http://${VM_IP}:3000"
+  ok "Park board API:  http://${VM_IP}:3100"
   ok "Bootstrap token: ${BOOTSTRAP_TOKEN}"
   ok "API key:         ${API_KEY}"
   warn "Save the bootstrap token and API key — you will need them to connect edge nodes"
