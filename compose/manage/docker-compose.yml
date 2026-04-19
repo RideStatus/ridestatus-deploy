@@ -8,6 +8,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/ridestatus/.ssh:/home/ridestatus/.ssh:ro
+      - /opt/ridestatus/docker-compose.yml:/opt/ridestatus/docker-compose.yml:ro
     pid: host
     depends_on:
       postgres:
