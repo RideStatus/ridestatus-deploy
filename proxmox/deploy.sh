@@ -58,7 +58,6 @@ GHCR_TOKEN_FILE="/root/.config/ridestatus/ghcr-token"
 
 # =============================================================================
 # Step 1 — GitHub token (plain terminal, no dialog)
-# Read from saved file if present; otherwise walk the user through creating one.
 # =============================================================================
 GITHUB_TOKEN=""
 
@@ -120,7 +119,7 @@ read -r
 clear
 
 # =============================================================================
-# Temp file for dialog output — avoids $() subshell losing the TTY
+# Temp file for dialog output
 # =============================================================================
 _DLG_TMP=$(mktemp /tmp/ridestatus-dlg-XXXXXX)
 _WORK_DIR=$(mktemp -d /tmp/ridestatus-deploy-XXXXXX)
@@ -284,12 +283,6 @@ DEPLOY_PUBKEY_CONTENT=$(cat "${DEPLOY_KEY}.pub")
 
 # =============================================================================
 # SSH helpers
-#
-# rssh      — BatchMode=yes, no TTY. For simple remote commands.
-# rssh_pipe — No BatchMode, no TTY. For piping heredocs (sudo bash -s).
-#             Output streams to the calling terminal normally.
-# rssh_tty  — Interactive TTY (-t -t). Only for docker compose pull/up
-#             which renders progress bars requiring a TTY.
 # =============================================================================
 _ssh_base_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o IdentitiesOnly=yes"
 
@@ -305,8 +298,6 @@ rssh() {
 }
 
 rssh_pipe() {
-  # Like rssh but without BatchMode — allows stdin/heredoc piping.
-  # Output (stdout+stderr) streams directly to the terminal.
   local ip=$1; shift
   for key in "$DEPLOY_KEY" "$ADMIN_KEY_PATH"; do
     [[ -f "$key" ]] || continue
@@ -524,6 +515,15 @@ SMTP_HOST="" SMTP_PORT="587" SMTP_USER="" SMTP_PASS=""
 PROXMOX_API_HOST="" PROXMOX_API_PORT="8006"
 PROXMOX_API_USER="" PROXMOX_API_PASS="" PROXMOX_API_NODE=""
 
+# dnsmasq config — collected if manage role + USB NICs present
+INSTALL_DNSMASQ=false
+DNSMASQ_IFACE="corp0"
+DNSMASQ_RANGE_START=""
+DNSMASQ_RANGE_END=""
+DNSMASQ_NETMASK=""
+DNSMASQ_GW=""
+DNSMASQ_LEASE="1h"
+
 if [[ "$VM_ROLE" == "server" ]]; then
   wt_input PARK_NAME       "Park name:"                       "My Park"
   wt_input PARK_TZ         "Timezone:"                        "America/Chicago"
@@ -542,14 +542,44 @@ if [[ "$VM_ROLE" == "server" ]]; then
 fi
 
 if [[ "$VM_ROLE" == "manage" ]]; then
-  # NOTE: SERVER_URL and SERVER_API_KEY are not collected here — the park board
-  # server does not exist yet. They are left blank in .env and filled in later.
   wt_msg "Proxmox API Credentials\n\nThe management plane uses the Proxmox API to provision new VMs.\nEnter the credentials for this Proxmox host."
   wt_input    PROXMOX_API_HOST "Proxmox API host (IP of this host):" "$(hostname -I | awk '{print $1}')"
   wt_input    PROXMOX_API_PORT "Proxmox API port:"                   "8006"
   wt_input    PROXMOX_API_USER "Proxmox API user (e.g. root@pam):"   "root@pam"
   wt_password PROXMOX_API_PASS "Proxmox API password:"
   wt_input    PROXMOX_API_NODE "Proxmox node name:"                  "${PROXMOX_NODE}"
+
+  # Offer dnsmasq if any USB NIC was configured
+  _has_usb=false
+  for i in "${!VM_NIC_TYPES[@]}"; do
+    [[ "${VM_NIC_TYPES[$i]}" == "usb" ]] && _has_usb=true && break
+  done
+
+  if $_has_usb; then
+    if wt_yesno "DHCP Server (dnsmasq)\n\nA USB NIC was configured for the corporate/field network.\nInstall dnsmasq to serve DHCP on that interface?\n\nThis gives new Pis a temporary IP when plugged in so they can be discovered and provisioned."; then
+      INSTALL_DNSMASQ=true
+
+      # Determine which corp interface index to use (first USB NIC = corp0)
+      DNSMASQ_IFACE="corp0"
+
+      # Derive subnet info from first USB NIC IP
+      _first_usb_ip=""
+      for i in "${!VM_NIC_TYPES[@]}"; do
+        [[ "${VM_NIC_TYPES[$i]}" == "usb" ]] || continue
+        _first_usb_ip="${VM_NIC_IPS[$i]}"
+        break
+      done
+      # Suggest netmask from CIDR
+      _cidr_prefix="${_first_usb_ip##*/}"
+      _base_ip="${_first_usb_ip%%/*}"
+
+      wt_input DNSMASQ_RANGE_START "DHCP range start:" ""
+      wt_input DNSMASQ_RANGE_END   "DHCP range end:"   ""
+      wt_input DNSMASQ_NETMASK     "Subnet mask (e.g. 255.255.255.128):" ""
+      wt_input DNSMASQ_GW          "Gateway for DHCP clients:" ""
+      wt_input DNSMASQ_LEASE       "Lease time (e.g. 1h, 30m):" "1h"
+    fi
+  fi
 fi
 
 # =============================================================================
@@ -561,6 +591,7 @@ for i in "${!VM_NIC_TYPES[@]}"; do
   _dr=""; [[ "${VM_NIC_DR[$i]}" == "yes" ]] && _dr=" [GW=${VM_NIC_GWS[$i]}]"
   _summary+="  vNIC$((i+1)): ${VM_NIC_TYPES[$i]} ${VM_NIC_IPS[$i]}${_dr}\n"
 done
+$INSTALL_DNSMASQ && _summary+="  DHCP: ${DNSMASQ_RANGE_START}-${DNSMASQ_RANGE_END} on ${DNSMASQ_IFACE}\n"
 [[ -n "$PARK_NAME" ]] && _summary+="\nPark: ${PARK_NAME}  TZ: ${PARK_TZ}"
 
 wt_yesno "Confirm deployment:\n\n${_summary}\n\nProceed?" \
@@ -664,14 +695,13 @@ wait_ssh "$VM_IP"
 
 # =============================================================================
 # Install Docker + kernel modules for USB NICs
-# Uses rssh_pipe — no TTY, stdin piping allowed, output streams to terminal.
 # =============================================================================
 header "Installing Docker"
 rssh_pipe "$VM_IP" "sudo bash -s" <<'DOCKER_INSTALL'
 set -e
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y --no-install-recommends ca-certificates curl gnupg
+apt-get install -y --no-install-recommends ca-certificates curl gnupg sshpass
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
   | gpg --batch --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -692,9 +722,7 @@ DOCKER_INSTALL
 ok "Docker installed"
 
 # =============================================================================
-# Configure USB NICs via netplan (post-boot, after driver is loaded)
-# USB NICs are passed through directly so cloud-init can't configure them.
-# We write a netplan file and apply it after the driver is loaded.
+# Configure USB NICs via netplan
 # =============================================================================
 USB_NIC_COUNT=0
 for i in "${!VM_NIC_TYPES[@]}"; do
@@ -705,10 +733,6 @@ done
 if [[ $USB_NIC_COUNT -gt 0 ]]; then
   header "Configuring USB NIC(s) via netplan"
 
-  # Build a netplan YAML for all USB NICs.
-  # We match by MAC address so the config survives renames.
-  # Interface is renamed to corp0, corp1, etc. for clarity.
-  # No default route — USB NICs are field/corporate network only.
   NETPLAN_FILE="${_WORK_DIR}/99-ridestatus-corp.yaml"
   {
     echo "network:"
@@ -735,7 +759,6 @@ if [[ $USB_NIC_COUNT -gt 0 ]]; then
 set -e
 mv /tmp/99-ridestatus-corp.yaml /etc/netplan/99-ridestatus-corp.yaml
 chmod 600 /etc/netplan/99-ridestatus-corp.yaml
-# Trigger USB rebind so driver attaches to the device
 echo '3-1' > /sys/bus/usb/drivers/usb/unbind 2>/dev/null || true
 sleep 1
 echo '3-1' > /sys/bus/usb/drivers/usb/bind 2>/dev/null || true
@@ -744,6 +767,53 @@ netplan apply
 echo "USB NIC netplan applied"
 USB_NETPLAN
   ok "USB NIC(s) configured"
+fi
+
+# =============================================================================
+# Install dnsmasq DHCP server (manage role, if requested)
+# Serves DHCP only on the corporate/field NIC (corp0).
+# New Pis get a temporary IP so they can be discovered and provisioned.
+# =============================================================================
+if $INSTALL_DNSMASQ; then
+  header "Installing DHCP Server (dnsmasq)"
+
+  # Write config to a temp file and scp it over
+  DNSMASQ_CONF="${_WORK_DIR}/ridestatus-corp.conf"
+  cat > "$DNSMASQ_CONF" <<DNSMASQ
+# RideStatus Corporate/Field VLAN DHCP
+# Listens only on ${DNSMASQ_IFACE} — never touches other interfaces
+
+interface=${DNSMASQ_IFACE}
+bind-interfaces
+
+# DHCP pool and lease time
+dhcp-range=${DNSMASQ_RANGE_START},${DNSMASQ_RANGE_END},${DNSMASQ_NETMASK},${DNSMASQ_LEASE}
+
+# Gateway
+dhcp-option=option:router,${DNSMASQ_GW}
+
+# DNS: Cloudflare + Google
+dhcp-option=option:dns-server,1.1.1.1,8.8.8.8
+
+# Domain
+dhcp-option=option:domain-name,ridestatus.local
+
+# Log DHCP activity
+log-dhcp
+DNSMASQ
+
+  rscp "$DNSMASQ_CONF" "$VM_IP" "/tmp/ridestatus-corp.conf"
+  rssh_pipe "$VM_IP" "sudo bash -s" <<'DNSMASQ_INSTALL'
+set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y dnsmasq
+mv /tmp/ridestatus-corp.conf /etc/dnsmasq.d/ridestatus-corp.conf
+systemctl enable dnsmasq
+systemctl restart dnsmasq
+systemctl is-active dnsmasq
+echo "dnsmasq installed and running"
+DNSMASQ_INSTALL
+  ok "DHCP server installed (dnsmasq on ${DNSMASQ_IFACE}: ${DNSMASQ_RANGE_START}–${DNSMASQ_RANGE_END})"
 fi
 
 # =============================================================================
@@ -759,10 +829,7 @@ if [[ -n "$GITHUB_TOKEN" ]]; then
 fi
 
 # =============================================================================
-# Write .env file locally then SCP it
-# Port assignments:
-#   manage: PORT=3000  (ridestatus-manage listens on 3000)
-#   server: API_PORT=3100  (ridestatus-server listens on 3100)
+# Write .env and docker-compose.yml
 # =============================================================================
 header "Deploying ${VM_ROLE}"
 
@@ -786,7 +853,6 @@ PROXMOX_USER=${PROXMOX_API_USER}
 PROXMOX_PASSWORD=${PROXMOX_API_PASS}
 PROXMOX_NODE=${PROXMOX_API_NODE}
 MANAGE_SSH_KEY_PATH=/home/ridestatus/.ssh/ansible_ridestatus
-# Fill in once ridestatus-server is deployed on the park board host:
 SERVER_URL=
 SERVER_API_KEY=
 GITHUB_TOKEN=${GITHUB_TOKEN}
@@ -830,7 +896,6 @@ ok "Configuration deployed"
 
 # =============================================================================
 # Start services
-# rssh_tty — docker compose pull needs a TTY for progress bar rendering.
 # =============================================================================
 header "Starting Services"
 step "Pulling Docker images (this may take a few minutes)..."
@@ -843,8 +908,6 @@ ok "Services started"
 # =============================================================================
 if [[ "$VM_ROLE" == "manage" ]]; then
   header "Configuring Automatic Updates"
-
-  step "Configuring unattended security upgrades..."
   rssh_pipe "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
 set -e
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -865,12 +928,11 @@ CONF
 systemctl enable --now unattended-upgrades
 echo "Automatic updates configured"
 AUTO_UPDATE
-  ok "unattended-upgrades enabled (security patches, no auto-reboot)"
+  ok "unattended-upgrades enabled"
 fi
 
 # =============================================================================
-# Wait for service to respond
-# manage listens on 3000, server listens on 3100
+# Wait for service
 # =============================================================================
 case "$VM_ROLE" in
   manage) wait_http "http://${VM_IP}:3000" ;;
@@ -902,5 +964,8 @@ if [[ "$VM_ROLE" == "manage" ]]; then
   ok "Default login:  admin / admin  (change immediately)"
   warn "SERVER_URL and SERVER_API_KEY in /opt/ridestatus/.env are blank."
   warn "Fill them in once the park board server is deployed."
+  if $INSTALL_DNSMASQ; then
+    ok "DHCP server:    dnsmasq on ${DNSMASQ_IFACE} — ${DNSMASQ_RANGE_START}–${DNSMASQ_RANGE_END} (${DNSMASQ_LEASE} leases)"
+  fi
 fi
 echo ""
