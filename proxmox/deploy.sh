@@ -559,7 +559,7 @@ _summary="VM ${VMID} — ${VM_HOST} (${VM_ROLE})\n"
 _summary+="RAM: ${VM_RAM}GB  CPU: ${VM_CORES}  Disk: ${VM_DISK}GB\n"
 for i in "${!VM_NIC_TYPES[@]}"; do
   _dr=""; [[ "${VM_NIC_DR[$i]}" == "yes" ]] && _dr=" [GW=${VM_NIC_GWS[$i]}]"
-  _summary+="  vNIC$((i+1)): ${VM_NIC_IPS[$i]}${_dr}\n"
+  _summary+="  vNIC$((i+1)): ${VM_NIC_TYPES[$i]} ${VM_NIC_IPS[$i]}${_dr}\n"
 done
 [[ -n "$PARK_NAME" ]] && _summary+="\nPark: ${PARK_NAME}  TZ: ${PARK_TZ}"
 
@@ -636,7 +636,7 @@ for i in "${!VM_NIC_TYPES[@]}"; do
   fi
 done
 
-# Cloud-init IP config
+# Cloud-init IP config (bridge NICs only — USB NICs configured via netplan post-boot)
 qm set "$VMID" --ide2 "${CI_STORAGE}:cloudinit"
 ipcfg_idx=0
 for i in "${!VM_NIC_TYPES[@]}"; do
@@ -663,7 +663,7 @@ wait_agent "$VMID"
 wait_ssh "$VM_IP"
 
 # =============================================================================
-# Install Docker
+# Install Docker + kernel modules for USB NICs
 # Uses rssh_pipe — no TTY, stdin piping allowed, output streams to terminal.
 # =============================================================================
 header "Installing Docker"
@@ -674,7 +674,7 @@ apt-get update -qq
 apt-get install -y --no-install-recommends ca-certificates curl gnupg
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  | gpg --batch --dearmor -o /etc/apt/keyrings/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
   https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
@@ -683,9 +683,68 @@ apt-get update -qq
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 usermod -aG docker ridestatus
 systemctl enable docker
+# Install kernel extra modules for USB NIC support (e.g. ASIX AX88179)
+apt-get install -y linux-modules-extra-$(uname -r) || true
+echo "ax88179_178a" >> /etc/modules-load.d/ridestatus.conf
+modprobe ax88179_178a 2>/dev/null || true
 echo "Docker installed"
 DOCKER_INSTALL
 ok "Docker installed"
+
+# =============================================================================
+# Configure USB NICs via netplan (post-boot, after driver is loaded)
+# USB NICs are passed through directly so cloud-init can't configure them.
+# We write a netplan file and apply it after the driver is loaded.
+# =============================================================================
+USB_NIC_COUNT=0
+for i in "${!VM_NIC_TYPES[@]}"; do
+  [[ "${VM_NIC_TYPES[$i]}" == "usb" ]] || continue
+  USB_NIC_COUNT=$(( USB_NIC_COUNT + 1 ))
+done
+
+if [[ $USB_NIC_COUNT -gt 0 ]]; then
+  header "Configuring USB NIC(s) via netplan"
+
+  # Build a netplan YAML for all USB NICs.
+  # We match by MAC address so the config survives renames.
+  # Interface is renamed to corp0, corp1, etc. for clarity.
+  # No default route — USB NICs are field/corporate network only.
+  NETPLAN_FILE="${_WORK_DIR}/99-ridestatus-corp.yaml"
+  {
+    echo "network:"
+    echo "  version: 2"
+    echo "  ethernets:"
+    corp_idx=0
+    for i in "${!VM_NIC_TYPES[@]}"; do
+      [[ "${VM_NIC_TYPES[$i]}" == "usb" ]] || continue
+      local_mac="${USB_NIC_MAC[${VM_NIC_USBS[$i]}]:-}"
+      local_ip="${VM_NIC_IPS[$i]}"
+      echo "    corp${corp_idx}:"
+      echo "      match:"
+      echo "        macaddress: ${local_mac}"
+      echo "      set-name: corp${corp_idx}"
+      echo "      dhcp4: false"
+      echo "      addresses:"
+      echo "        - ${local_ip}"
+      corp_idx=$(( corp_idx + 1 ))
+    done
+  } > "$NETPLAN_FILE"
+
+  rscp "$NETPLAN_FILE" "$VM_IP" "/tmp/99-ridestatus-corp.yaml"
+  rssh_pipe "$VM_IP" "sudo bash -s" <<'USB_NETPLAN'
+set -e
+mv /tmp/99-ridestatus-corp.yaml /etc/netplan/99-ridestatus-corp.yaml
+chmod 600 /etc/netplan/99-ridestatus-corp.yaml
+# Trigger USB rebind so driver attaches to the device
+echo '3-1' > /sys/bus/usb/drivers/usb/unbind 2>/dev/null || true
+sleep 1
+echo '3-1' > /sys/bus/usb/drivers/usb/bind 2>/dev/null || true
+sleep 2
+netplan apply
+echo "USB NIC netplan applied"
+USB_NETPLAN
+  ok "USB NIC(s) configured"
+fi
 
 # =============================================================================
 # Login to ghcr.io
@@ -781,39 +840,13 @@ ok "Services started"
 
 # =============================================================================
 # Automatic updates (manage role only)
-# self-update.sh is embedded here — no private repo access needed at deploy time.
-# Uses rssh_pipe for heredoc piping without terminal hijack.
 # =============================================================================
 if [[ "$VM_ROLE" == "manage" ]]; then
   header "Configuring Automatic Updates"
 
-  step "Writing self-update script..."
-  cat > "${_WORK_DIR}/self-update.sh" <<'SELFUPDATE'
-#!/bin/sh
-# Ride Status Manage — Self Update Script
-# Run by cron every 30 min and by the self-update API endpoint.
-set -eu
-LOG_FILE="/var/log/ridestatus-self-update.log"
-APP_DIR="/opt/ridestatus"
-echo "[$(date -Iseconds)] Starting self-update..." | tee -a "$LOG_FILE"
-cd "$APP_DIR"
-docker compose pull 2>&1 | tee -a "$LOG_FILE"
-docker compose up -d 2>&1 | tee -a "$LOG_FILE"
-docker image prune -f 2>&1 | tee -a "$LOG_FILE"
-echo "[$(date -Iseconds)] Self-update complete." | tee -a "$LOG_FILE"
-SELFUPDATE
-
-  step "Installing self-update script and cron job..."
-  rscp "${_WORK_DIR}/self-update.sh" "$VM_IP" "/tmp/self-update.sh"
+  step "Configuring unattended security upgrades..."
   rssh_pipe "$VM_IP" "sudo bash -s" <<'AUTO_UPDATE'
 set -e
-install -m 0755 /tmp/self-update.sh /opt/ridestatus/self-update.sh
-chown root:root /opt/ridestatus/self-update.sh
-touch /var/log/ridestatus-self-update.log
-chmod 644 /var/log/ridestatus-self-update.log
-echo "*/30 * * * * root /opt/ridestatus/self-update.sh >> /var/log/ridestatus-self-update.log 2>&1" \
-  > /etc/cron.d/ridestatus-manage-update
-chmod 644 /etc/cron.d/ridestatus-manage-update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   unattended-upgrades update-notifier-common
 tee /etc/apt/apt.conf.d/50unattended-upgrades > /dev/null <<'CONF'
@@ -832,7 +865,6 @@ CONF
 systemctl enable --now unattended-upgrades
 echo "Automatic updates configured"
 AUTO_UPDATE
-  ok "Self-update cron installed (every 30 min)"
   ok "unattended-upgrades enabled (security patches, no auto-reboot)"
 fi
 
@@ -868,7 +900,6 @@ fi
 if [[ "$VM_ROLE" == "manage" ]]; then
   ok "Management UI:  http://${VM_IP}:3000"
   ok "Default login:  admin / admin  (change immediately)"
-  ok "Self-update:    runs every 30 min via cron, or use the Dashboard button"
   warn "SERVER_URL and SERVER_API_KEY in /opt/ridestatus/.env are blank."
   warn "Fill them in once the park board server is deployed."
 fi
