@@ -10,6 +10,7 @@ services:
       - /home/ridestatus/.ssh:/home/ridestatus/.ssh:ro
       - /root/.docker:/root/.docker:ro
       - /opt/ridestatus/docker-compose.yml:/opt/ridestatus/docker-compose.yml:ro
+      - /opt/ridestatus/.env:/opt/ridestatus/.env:ro
     pid: host
     depends_on:
       postgres:
