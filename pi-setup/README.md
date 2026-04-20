@@ -25,14 +25,14 @@ This guide covers how to prepare a Raspberry Pi 4 for use as a Ride Status edge 
 
 | Setting | Value |
 |---------|-------|
-| Hostname | `ridestatus` |
+| Hostname | `ridestatus-ride` |
 | Username | `ridestatus` |
 | Password | `RideControl` |
 | Enable SSH | Yes — Password authentication |
 | Locale / Timezone | Set as appropriate for your region |
 
-> **Important:** The hostname must be `ridestatus`. The Deploy page scans for
-> devices with `ridestatus` in their hostname to discover new Pis.
+> **Important:** The hostname must be `ridestatus-ride`. The Deploy page scans
+> for devices with `ridestatus` in their hostname to discover new Pis.
 
 6. Click **Save**, then **Yes** to apply customisation
 7. Confirm the flash and wait for it to complete
@@ -53,7 +53,7 @@ The Pi will boot and both NICs will come up via DHCP automatically:
 The USB NIC will receive a DHCP lease from the `ridestatus-manage` server
 in the range `10.15.140.90`–`10.15.140.99`.
 
-> **Note:** First boot takes 2–3 minutes while cloud-init runs and SSH starts.
+> **Note:** First boot takes 2–3 minutes while the system initializes and SSH starts.
 
 ---
 
@@ -61,8 +61,8 @@ in the range `10.15.140.90`–`10.15.140.99`.
 
 1. Open the Ride Status Management UI at `http://10.15.140.101:3000`
 2. Go to **Deploy**
-3. Enter the SSH password (`RideControl`) and the DHCP subnet (`10.15.140.90/28`)
-4. Click **Scan** — the new Pi will appear with hostname `ridestatus`
+3. Enter the SSH password (`RideControl`) and the DHCP subnet (`10.15.140.88/29`)
+4. Click **Scan** — the new Pi will appear with hostname `ridestatus-ride`
 5. Click **Provision** and fill in:
    - **Ride Name**: lowercase slug (e.g. `batman`)
    - **Display Name**: human-readable name (e.g. `Batman`)
@@ -70,8 +70,8 @@ in the range `10.15.140.90`–`10.15.140.99`.
    - **Gateway**: `10.15.140.1`
    - **PLC Protocol**: select appropriate protocol
    - **PLC IP**: IP address of the PLC on the ride network
-   - **Ride Network NIC**: select `eth0` (built-in, connected to PLC network)
-   - **RideStatus Network NIC**: select the `enx...` USB NIC
+   - **Ride Network NIC**: select `eth0` (built-in, connected to PLC network) or the USB NIC if wired differently
+   - **RideStatus Network NIC**: select the `enx...` USB NIC (or `eth0` if wired differently)
 6. Click **Provision Node**
 
 Provisioning takes 5–10 minutes. The Pi will:
@@ -87,9 +87,9 @@ After provisioning the Pi will appear green on the Dashboard.
 ## NIC Notes
 
 - Pi OS Bookworm uses **NetworkManager** which brings up all NICs (including USB) automatically
-- The USB NIC is named using its MAC address (e.g. `enxc8a362a8bf8a`) — the exact name will vary per device
-- The NIC dropdowns in the Provision form are populated from the actual interfaces on the Pi — no need to guess names
-- At some rides `eth0` is the ride/PLC network; at others the USB NIC may be the ride network and `eth0` is RideStatus. Select accordingly in the provision form.
+- The USB NIC is named using its MAC address (e.g. `enxc8a362a8bf8a`) — the exact name varies per device
+- The NIC dropdowns in the Provision form show the actual interfaces on the Pi — no need to guess names
+- At some rides `eth0` is the ride/PLC network; at others the USB NIC may be the ride network and `eth0` is RideStatus — select accordingly in the provision form
 
 ---
 
@@ -103,7 +103,7 @@ After provisioning the Pi will appear green on the Dashboard.
 
 **SSH refused:**
 - Confirm SSH was enabled in Pi Imager customisation
-- Confirm hostname was set to `ridestatus`
+- Confirm hostname was set to `ridestatus-ride`
 - Try connecting manually: `ssh ridestatus@<ip>`
 
 **Provisioning fails at Docker pull:**
