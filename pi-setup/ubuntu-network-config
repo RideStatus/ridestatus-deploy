@@ -1,0 +1,20 @@
+# network-config
+#
+# This file is NOT needed for Raspberry Pi OS (it handles all interfaces
+# via DHCP automatically using NetworkManager).
+#
+# It IS needed if you use the Ubuntu Raspberry Pi image instead.
+# Place this file on the bootfs partition before first boot.
+#
+# Ubuntu only — not for Raspberry Pi OS
+
+version: 2
+ethernets:
+  all-eth:
+    match:
+      name: "eth*"
+    dhcp4: true
+  all-usb:
+    match:
+      name: "enx*"
+    dhcp4: true
