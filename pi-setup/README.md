@@ -1,97 +1,67 @@
-# Raspberry Pi Setup Guide
+# Pi Setup Guide
 
-This guide covers how to flash and prepare a Raspberry Pi 4 for use as a RideStatus edge node.
+This guide covers how to prepare a Raspberry Pi 4 for use as a RideStatus edge node.
 
-## Requirements
+## Hardware Requirements
 
 - Raspberry Pi 4 (any RAM variant)
 - MicroSD card (16GB minimum, 32GB recommended)
-- [Raspberry Pi Imager](https://www.raspberrypi.com/software/)
-- USB NIC (for corporate/field network connectivity)
+- USB Ethernet adapter (ASIX AX88179 or compatible) for the corporate/field network
+- Built-in Ethernet (`eth0`) for the ride/PLC network
 
----
+## OS
+
+**Raspberry Pi OS Lite (64-bit, Bookworm)** 
+Do not use the Ubuntu Raspberry Pi image — USB NICs do not reliably start on first boot.
 
 ## Flashing the SD Card
 
-### 1. Open Raspberry Pi Imager
+1. Download and open **Raspberry Pi Imager**
+2. Choose **Raspberry Pi 4** as the device
+3. Choose **Raspberry Pi OS Lite (64-bit)** as the OS
+4. Choose your SD card
+5. Click the **gear icon** (OS Customisation) and set:
 
-- **Device**: Raspberry Pi 4
-- **OS**: Raspberry Pi OS Lite (64-bit) — under *Raspberry Pi OS (other)*
-- **Storage**: Select your SD card
+   | Setting | Value |
+   |---------|-------|
+   | Hostname | `ridestatus` |
+   | Username | `ridestatus` |
+   | Password | `RideControl` |
+   | Enable SSH | Yes — Password authentication |
 
-### 2. Open OS Customisation
+6. Click **Save**, then **Write**
 
-Click the **Edit Settings** button (or press Ctrl+Shift+X) and configure:
+## How It Works
 
-| Setting | Value |
-|---------|-------|
-| Hostname | `ridestatus` |
-| Username | `ridestatus` |
-| Password | *(your site password)* |
-| Enable SSH | ✓ — Password authentication |
-| Locale / Timezone | Set to your local timezone |
+Raspberry Pi OS Bookworm uses **NetworkManager**, which automatically creates DHCP connection profiles for all detected network interfaces — including the USB Ethernet adapter — on first boot. No additional network configuration files are needed.
 
-> **Important:** The hostname must contain `ridestatus` — this is how the Deploy page scan identifies new Pis on the network.
+When the Pi boots with both NICs connected:
+- `eth0` (built-in) will request a DHCP address from whatever server is on the ride/PLC network
+- The USB NIC (`enx...`) will request a DHCP address from the RideStatus management server (`ridestatus-manage`) on the corporate VLAN, receiving an IP in the provisioning range (`10.15.140.90–99`)
 
-### 3. Flash
-
-Click **Save**, then **Yes** to apply customisation, then **Yes** to confirm flashing.
-
----
-
-## Network Behaviour on First Boot
-
-Raspberry Pi OS Bookworm uses **NetworkManager**, which automatically brings up all network interfaces via DHCP on first boot — including the USB NIC. No extra configuration files are needed on the boot partition.
-
-When the Pi boots with the USB NIC connected to the corporate/field network:
-
-- The USB NIC (`enx...`) will request a DHCP address from the RideStatus management server
-- The Pi will receive an IP in the provisioning range (e.g. `10.15.140.90`–`10.15.140.99`)
-- The Pi will appear in the **Deploy** page scan in the management UI
-
----
+The hostname `ridestatus` is what allows the Deploy page to discover the Pi during a network scan.
 
 ## Provisioning
 
-Once the Pi appears in the Deploy page scan:
+Once the Pi is booted and connected to both networks:
 
-1. Click **Provision** next to the Pi
-2. Fill in:
-   - **Ride Name** — slug (e.g. `batman`)
-   - **Display Name** — human name (e.g. `Batman`)
-   - **Static IP / Prefix** — permanent IP for this Pi (e.g. `10.15.140.13/25`)
-   - **Gateway** — `10.15.140.1`
-   - **SSH Password** — the password set in Pi Imager
-   - **PLC Protocol / IP / Slot** — PLC connection details
-   - **Ride Network NIC** — NIC connected to the PLC network (select from dropdown)
-   - **RideStatus Network NIC** — USB NIC connected to the corporate VLAN (select from dropdown)
-3. Click **Provision Node**
+1. In the RideStatus management UI, go to **Deploy**
+2. Enter the corporate VLAN subnet (e.g. `10.15.140.0/25`) and the SSH password (`RideControl`)
+3. Click **Scan** — the Pi will appear with hostname `ridestatus` and its DHCP address
+4. Click **Provision**, fill in the ride name, static IP, PLC details, and NIC assignments
+5. The provisioner will SSH in, set a static IP, install Docker, pull the edge image, and register the node
 
-The management server will SSH into the Pi, install Docker, pull the edge node image, configure the static IP, and register the node. The DHCP lease will expire within 1 hour and the IP will be available for the next Pi.
+## NIC Assignment During Provisioning
 
----
+The provisioning form will show a dropdown of actual interface names from the Pi. Select:
+- **Ride Network NIC**: the interface connected to the PLC (`eth0` on most Pis, but verify)
+- **RideStatus Network NIC**: the USB NIC connected to the corporate VLAN (`enx...`)
 
-## NIC Identification
+The USB NIC name is based on its MAC address and will look like `enxc8a362a8bf8a`. The dropdown will show the actual name — just pick the one that isn’t `eth0`.
 
-The Pi 4 built-in NIC is always `eth0`. The USB NIC is named by NetworkManager based on its MAC address, e.g. `enxc8a362a8bf8a`. The provision form fetches the actual interface names from the Pi automatically — the tech just selects the correct one from the dropdown for each role.
+## Notes
 
-If unsure which is which:
-- `eth0` = built-in RJ45 port on the Pi board itself
-- `enx...` = USB NIC (plugged into a USB port)
-
----
-
-## Troubleshooting
-
-**Pi not appearing in scan after booting:**
-- Confirm the USB NIC is plugged in and has a link light
-- Confirm the Pi has been booted for at least 2 minutes (NetworkManager takes a moment to bring up interfaces)
-- Check dnsmasq leases on the manage VM: `cat /var/lib/misc/dnsmasq.leases`
-- Try scanning manually from the manage VM: `ping -c1 -I corp0 10.15.140.90` through `.99`
-
-**SSH password rejected during provisioning:**
-- Confirm the password matches what was set in Pi Imager
-- The password field in the Scan form pre-fills into the Provision form — make sure it wasn't changed
-
-**Pi shows up on old static IP instead of DHCP range:**
-- The SD card may not have been freshly flashed — reflash and try again
+- The provisioning process installs the admin SSH key so subsequent access uses key-based auth
+- After provisioning the Pi’s static IP is set via netplan on the RideStatus NIC
+- The DHCP lease (temporary IP) will expire after 1 hour and free up the slot for the next Pi
+- Do not set a static IP in Pi Imager — leave networking as DHCP so the Pi is discoverable
